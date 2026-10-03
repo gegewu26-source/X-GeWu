@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+*.zip
+work/
+outputs/
+验证记录*
+关注管理验证*
+.DS_Store
+Thumbs.db
