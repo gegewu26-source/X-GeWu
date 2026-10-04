@@ -2,7 +2,7 @@
 // @name         X GeWu
 // @name:zh-CN   X GeWu
 // @namespace    https://x.com/gegewu203
-// @version      0.3.13
+// @version      0.3.14
 // @description  Clean your own X posts by date, highlight following relationships and unfollow accounts without a visible follow-back indicator. Dry Run, verified actions and quotas. Visits @gegewu203 on first use, then at most once every 15 days.
 // @description:zh-CN  按日期清理本人的 X 帖子；关注列表标注回关关系、记录观察到的互关历史并批量取关未显示回关的账号。默认模拟、保留名单与操作上限；首次使用跳转至 @gegewu203 主页，之后每 15 天最多一次。
 // @author       GeWu (@gegewu203)
@@ -49,7 +49,7 @@
         try { return localStorage.getItem('xpc_debug') === '1'; } catch (err) { return false; }
     })();
 
-    const VERSION = '0.3.13';
+    const VERSION = '0.3.14';
     const SCRIPT_NAME = 'X GeWu';
 
     const CONFIG = {
@@ -59,6 +59,7 @@
         SCROLL_WAIT_MS: 6000,      // 滚动后等待新内容加载
         SCROLL_REWAIT_MS: 3000,    // 连续第二次"没有新内容"时的等待（加快到底判定）
         SCROLL_SETTLE_MS: 180,     // 滚动已前进时只短暂等待渲染，不空等完整加载超时
+        SCROLL_STALL_MS: 45000,    // 持续加载/滚动但没有新增扫描结果时暂停，保留已收集内容
         RETRY_DELAY_MS: 1000,      // 单条失败后、重试前的等待（需求 18）
         MAX_ATTEMPTS: 3,           // 1 次原始尝试 + 最多 2 次重试（需求 18）
         FAILURE_BREAKER: 5,        // 连续失败熔断阈值（需求 29）
@@ -1033,32 +1034,102 @@
         return eligible;
     }
 
-    // 滚动加载下一批（需求十三）；waitMs 可覆盖本轮等待时长。
-    // 返回是否有「未见过的帖子」出现。
+    function postScrollTarget() {
+        const root = document.querySelector(SELECTORS.primaryColumn);
+        for (let node = root; node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+            const style = window.getComputedStyle(node);
+            if (/(?:auto|scroll)/.test(style.overflowY || style.overflow)
+                && node.scrollHeight > node.clientHeight + 2 && isVisible(node)) return node;
+        }
+        return null; // document scrolling continues to use the window APIs.
+    }
+
+    function postScrollPosition(target) {
+        return Number(target ? target.scrollTop : window.scrollY) || 0;
+    }
+
+    function postTimelineSignals(root) {
+        if (!root) return { loading: true, error: '' };
+        const outsidePosts = (node) => !node.closest('article, aside, [data-testid="UserCell"]') && isVisible(node);
+        const errors = Array.from(root.querySelectorAll('[data-testid="retry"], [data-testid="error-detail"], [data-testid="error-message"]'))
+            .filter(outsidePosts);
+        const loading = Array.from(root.querySelectorAll('[role="progressbar"], [data-testid="spinner"]')).some(outsidePosts);
+        return { loading, error: errors.length ? truncate(getItemText(errors[0]) || '时间线加载失败', 100) : '' };
+    }
+
+    function hasUnscannedPosts(root) {
+        if (!root) return false;
+        for (const article of root.querySelectorAll(SELECTORS.article)) {
+            if ((article.parentElement && article.parentElement.closest('article')) || !isVisible(article)) continue;
+            const main = mainStatus(article);
+            if (main && state.seenIds.has(main.info.id)) continue;
+            if (!main) { if (!state.unknownElements.has(article)) return true; continue; }
+            const post = parseArticle(article);
+            if (post ? !state.seenIds.has(post.id) : !state.unknownElements.has(article)) return true;
+        }
+        return false;
+    }
+
+    function newPostScanProgress() {
+        return { scanned: state.stats.scanned, lastProgressAt: Date.now(), emptyRounds: 0 };
+    }
+
+    function recordPostScanProgress(progress) {
+        if (progress.scanned !== state.stats.scanned) {
+            progress.scanned = state.stats.scanned;
+            progress.lastProgressAt = Date.now();
+            progress.emptyRounds = 0;
+        }
+    }
+
+    function postScanReachedEnd(progress, result) {
+        if (result.error) {
+            autoPause('X 时间线加载失败：' + result.error + '。已保留扫描结果，请在页面恢复后点击继续。');
+            return false;
+        }
+        if (result.newPosts) { progress.emptyRounds = 0; return false; }
+        if (Date.now() - progress.lastProgressAt >= CONFIG.SCROLL_STALL_MS) {
+            autoPause('X 时间线长时间没有加载新帖子。已保留扫描结果，请检查页面，加载恢复后点击继续。');
+            return false;
+        }
+        // Scrolling is useful for reaching the loading sentinel, but is not new-content progress.
+        if (result.loading || result.advanced) progress.emptyRounds = 0;
+        else progress.emptyRounds++;
+        return progress.emptyRounds >= 3;
+    }
+
+    // Loading, scrolling and genuinely new posts are separate outcomes.
     async function scrollAndWaitForNew(waitMs) {
-        if (candidateLimitReached() || !canAct()) return false;
-        const beforeY = window.scrollY;
+        if (candidateLimitReached() || !canAct()) return { newPosts: false, advanced: false };
+        const target = postScrollTarget();
+        const beforeY = postScrollPosition(target);
         const startedAt = Date.now();
         const limit = activeSettings().maxDelete;
         log('正在加载更多帖子（符合条件 ' + state.stats.matched + (limit > 0 ? '/' + limit : '') + '）');
         // 小步且保留重叠区域，避免跳过虚拟时间线中未扫描的帖子。
-        window.scrollBy({ top: Math.max(240, Math.round(window.innerHeight * 0.65)), behavior: 'instant' });
+        const step = Math.max(240, Math.round((target ? target.clientHeight : window.innerHeight) * 0.65));
+        if (target) {
+            if (typeof target.scrollBy === 'function') target.scrollBy({ top: step, behavior: 'instant' });
+            else target.scrollTop += step;
+        } else window.scrollBy({ top: step, behavior: 'instant' });
 
         const found = await waitForCondition(() => {
             const root = document.querySelector(SELECTORS.primaryColumn);
-            if (!root) return false;
-            const articles = root.querySelectorAll(SELECTORS.article);
-            for (const articleEl of articles) {
-                const main = mainStatus(articleEl);
-                if (main && !state.seenIds.has(main.info.id)) return true;
-            }
+            if (hasUnscannedPosts(root)) return { newPosts: true, advanced: postScrollPosition(target) > beforeY + 2 };
+            const signals = postTimelineSignals(root);
+            if (signals.error) return { newPosts: false, advanced: false, ...signals };
             // 时间线已滚动但仍是同一批已加载内容：短暂让出渲染时间后继续前进，
             // 不能每一步都空等 6 秒。到页面底部无法前进时才等待新内容。
-            if (window.scrollY > beforeY + 2 && Date.now() - startedAt >= CONFIG.SCROLL_SETTLE_MS) return true;
+            if (postScrollPosition(target) > beforeY + 2 && Date.now() - startedAt >= CONFIG.SCROLL_SETTLE_MS) {
+                return { newPosts: false, advanced: true, ...signals };
+            }
             return false;
         }, waitMs || CONFIG.SCROLL_WAIT_MS, '等待新帖子加载', () => !canAct());
 
-        return !!found || window.scrollY > beforeY + 2;
+        // Even an immediately available result must yield to Stop/Pause and rendering.
+        await sleep(0);
+        return found || { newPosts: false, advanced: postScrollPosition(target) > beforeY + 2,
+            ...postTimelineSignals(document.querySelector(SELECTORS.primaryColumn)) };
     }
 
     // 在当前 DOM 中按 id 找回帖子元素（重试时元素可能已被 React 重建）
@@ -1457,25 +1528,31 @@
     }
 
     async function runScan() {
-        const startScrollY = window.scrollY;
-        let endStreak = 0;
+        const initialTarget = postScrollTarget();
+        const startScrollY = postScrollPosition(initialTarget);
+        let progress = newPostScanProgress();
         while (taskActive()) {
+            const wasPaused = state.paused;
             await pauseGate();
             if (!taskActive()) break;
+            if (wasPaused) progress = newPostScanProgress();
             if (!canAct()) continue;
             scanVisible();
+            recordPostScanProgress(progress);
             updatePanel();
             const limit = activeSettings().maxDelete;
             if (limit > 0 && state.stats.matched >= limit) {
                 log('符合条件已达到扫描目标数量（' + limit + '），停止扫描'); break;
             }
-            const gotNew = await scrollAndWaitForNew(endStreak > 0 ? CONFIG.SCROLL_REWAIT_MS : 0);
+            const result = await scrollAndWaitForNew(progress.emptyRounds > 0 ? CONFIG.SCROLL_REWAIT_MS : 0);
             if (!taskActive() || state.paused) continue;
-            endStreak = gotNew ? 0 : endStreak + 1;
-            if (endStreak >= 3) { log('连续三次未发现新帖子，扫描结束'); break; }
+            if (postScanReachedEnd(progress, result)) { log('连续三次未发现新帖子，扫描结束'); break; }
         }
         if (!state.stopRequested && location.href === state.taskContext.href) {
-            try { window.scrollTo(0, startScrollY); } catch (err) { /* noop */ }
+            try {
+                if (initialTarget) { if (initialTarget.isConnected) initialTarget.scrollTop = startScrollY; }
+                else window.scrollTo(0, startScrollY);
+            } catch (err) { /* noop */ }
         }
         const bt = state.byType;
         log('已扫描 ' + state.stats.scanned + ' 条：帖子 ' + bt.post + ' / 回复 ' + bt.reply
@@ -1489,10 +1566,12 @@
         const enabled = Object.keys(opts.types).filter((type) => opts.types[type]).map((type) => TYPE_LABELS[type]);
         log('类型 [' + enabled.join('/') + '] ｜ 上限 ' + (opts.maxDelete || '无限制')
             + ' ｜ 间隔 ' + opts.intervalMinSec + '~' + opts.intervalMaxSec + ' 秒');
-        let endStreak = 0;
+        let progress = newPostScanProgress();
         while (taskActive()) {
+            const wasPaused = state.paused;
             await pauseGate();
             if (!taskActive()) break;
+            if (wasPaused) progress = newPostScanProgress();
             // 优先结束已达目标的任务，避免卡在配额暂停或最后一批冷却中。
             const done = dry ? state.stats.wouldDelete : state.stats.deleted;
             if (opts.maxDelete > 0 && done >= opts.maxDelete) {
@@ -1503,21 +1582,25 @@
             }
             if (!canAct()) continue;
             if (!dry && !checkQuotaBeforeAction()) continue;
-            if (!dry) await batchCooldown();
+            if (!dry) {
+                const cooldownStartedAt = Date.now();
+                await batchCooldown();
+                progress.lastProgressAt += Date.now() - cooldownStartedAt;
+            }
             if (!taskActive() || state.paused || !canAct()) continue;
             const batch = scanVisible();
+            recordPostScanProgress(progress);
             updatePanel();
             if (!batch.length) {
                 if (candidateLimitReached()) {
                     log('已收集本次上限的候选，没有更多可处理候选，不再扫描新帖子'); break;
                 }
-                const gotNew = await scrollAndWaitForNew(endStreak > 0 ? CONFIG.SCROLL_REWAIT_MS : 0);
+                const result = await scrollAndWaitForNew(progress.emptyRounds > 0 ? CONFIG.SCROLL_REWAIT_MS : 0);
                 if (!taskActive() || state.paused) continue;
-                endStreak = gotNew ? 0 : endStreak + 1;
-                if (endStreak >= 3) { log('连续三次未发现新帖子，没有更多可处理内容'); break; }
+                if (postScanReachedEnd(progress, result)) { log('连续三次未发现新帖子，没有更多可处理内容'); break; }
                 continue;
             }
-            endStreak = 0;
+            progress.emptyRounds = 0;
             const target = batch[0];
             state.taskTriedIds.add(target.id);
             if (dry) state.dryRunTriedIds.add(target.id);
@@ -1557,6 +1640,8 @@
                 if (result.uncertain) autoPause('帖子 ' + target.id + ' 的操作结果待确认；该帖不会自动重试');
                 else await interruptibleSleep(800);
             }
+            // Active processing and its configured delay are not stalled timeline loading.
+            progress.lastProgressAt = Date.now();
             updatePanel();
         }
     }

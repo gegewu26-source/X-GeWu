@@ -6,7 +6,7 @@
 
 X GeWu is a Tampermonkey userscript for X / Twitter. Clean up posts by date and quantity, see follow relationships in three colors, and organize your account with less effort.
 
-**v0.3.13 · Tampermonkey · MIT**
+**v0.3.14 · Tampermonkey · MIT**
 
 [Install the script](https://raw.githubusercontent.com/gegewu26-source/X-GeWu/main/X-GeWu.user.js) · [Download the latest release](https://github.com/gegewu26-source/X-GeWu/releases/latest) · [Follow GeWu for updates](https://x.com/gegewu203)
 
@@ -14,6 +14,7 @@ X GeWu is a Tampermonkey userscript for X / Twitter. Clean up posts by date and 
 
 - **Date-based cleanup**: Select a date range to delete your posts, replies and quotes, or undo your reposts.
 - **You control the quantity**: Scanning stops as soon as the candidate limit is reached. Track candidates, pending items, session successes and cumulative successes.
+- **Resilient scanning**: Distinguishes new posts from scrolling and handles virtual lists. Long loading stalls pause with results preserved, so scanning can resume after the page recovers.
 - **Three-color follow relationships**: Blue for mutual follows, green for accounts that only follow you, and red for accounts you follow without a visible follow-back. Colors appear directly on account cards.
 - **Convenient follow management**: Scan non-follow-back candidates, open usernames in new tabs to review their profiles, then unfollow from the approved list.
 - **Protect important accounts**: Keep the usernames you choose out of the automatic unfollow list.
