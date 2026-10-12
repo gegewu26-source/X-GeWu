@@ -2,7 +2,7 @@
 // @name         X GeWu
 // @name:zh-CN   X GeWu
 // @namespace    https://x.com/gegewu203
-// @version      0.3.15
+// @version      0.3.16
 // @description  Clean your own X posts by date, highlight following relationships and unfollow accounts without a visible follow-back indicator. Dry Run, verified actions and quotas. Visits @gegewu203 on first use, then at most once every 15 days.
 // @description:zh-CN  按日期清理本人的 X 帖子；关注列表标注回关关系、记录观察到的互关历史并批量取关未显示回关的账号。默认模拟、保留名单与操作上限；首次使用跳转至 @gegewu203 主页，之后每 15 天最多一次。
 // @author       GeWu (@gegewu203)
@@ -16,7 +16,7 @@
 // @grant        unsafeWindow
 // @sandbox      JavaScript
 // @noframes
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 /*
@@ -40,7 +40,413 @@
 (function () {
     'use strict';
 
+    if (window.top !== window.self) return;
+    const timelineEvidence = createTimelineEvidence(window,
+        typeof unsafeWindow === 'undefined' ? window : unsafeWindow);
+    timelineEvidence.install();
+
     // =====================
+    // XGW_TIMELINE_EVIDENCE_BEGIN
+    // 只读同源时间线响应中的帖子关系；不发请求、不保留正文或请求凭据。
+    function createTimelineEvidence(localWindow, pageWindow) {
+        const records = new Map();
+        const states = new Map();
+        const MAX_RECORDS = 6000;
+        const MAX_NODES = 20000;
+        const MAX_DEPTH = 30;
+        const allowedOperations = new Set(['UserTweetsAndReplies', 'UserTweets', 'UserMedia', 'TweetDetail', 'SearchTimeline', 'HomeTimeline', 'HomeLatestTimeline']);
+        const parentKeys = ['in_reply_to_status_id_str', 'inReplyToStatusIdStr', 'in_reply_to_status_id', 'inReplyToStatusId'];
+        const conversationKeys = ['conversation_id_str', 'conversationIdStr', 'conversation_id', 'conversationId'];
+        const ignoredKeys = new Set(['entities', 'extended_entities', 'media', 'full_text', 'text', 'description', 'bio', 'note_tweet', 'card', 'core']);
+        const status = {
+            installed: false, fetchInstalled: false, xhrInstalled: false, pendingRequests: 0,
+            lastRequestAt: 0, lastResponseAt: 0, responses: 0, captures: 0,
+            nodeBudgetExceeded: 0, depthBudgetExceeded: 0, hookFailures: 0, parseFailures: 0
+        };
+        const now = () => Date.now();
+        const own = (value, key) => {
+            if (!value || (typeof value !== 'object' && typeof value !== 'function')) return undefined;
+            try {
+                const descriptor = Object.getOwnPropertyDescriptor(value, key);
+                return descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value') ? descriptor.value : undefined;
+            } catch (_) { return undefined; }
+        };
+        const has = (value, key) => {
+            try { return !!value && Object.prototype.hasOwnProperty.call(value, key); } catch (_) { return false; }
+        };
+        const normalizedId = value => {
+            if (typeof value === 'number') {
+                if (!Number.isSafeInteger(value) || value <= 0) return null;
+                value = String(value);
+            }
+            return typeof value === 'string' && /^[1-9]\d{0,24}$/.test(value) ? value : null;
+        };
+        const object = value => !!value && typeof value === 'object';
+
+        function classify(entity) {
+            const wrappers = new Set();
+            while (object(entity) && own(entity, '__typename') === 'TweetWithVisibilityResults') {
+                if (wrappers.has(entity) || wrappers.size >= 8) return null;
+                wrappers.add(entity);
+                entity = own(entity, 'tweet');
+            }
+            if (!object(entity) || Array.isArray(entity)) return null;
+            const typename = own(entity, '__typename');
+            if (typeof typename === 'string' && typename !== 'Tweet') return null;
+            const legacy = own(entity, 'legacy');
+            const data = object(legacy) && !Array.isArray(legacy) ? legacy : entity;
+            const id = normalizedId(own(entity, 'rest_id')) || normalizedId(own(entity, 'id_str')) || normalizedId(own(data, 'id_str'));
+            if (!id) return null;
+            const alternateIds = [own(entity, 'rest_id'), own(entity, 'id_str'), own(data, 'id_str')].map(normalizedId).filter(Boolean);
+            if (alternateIds.some(other => other !== id)) return null;
+            const hasRelationship = parentKeys.concat(conversationKeys).some(key => has(data, key) || has(entity, key));
+            const hasTweetShape = has(data, 'full_text') && has(data, 'created_at');
+            if (typename !== 'Tweet' && !hasRelationship && !hasTweetShape) return null;
+            if (typename === 'Tweet' && data === entity && !hasRelationship && !hasTweetShape) return null;
+
+            const signals = new Set();
+            const parents = new Set();
+            const conversations = new Set();
+            let hasParent = false;
+            let invalidParent = false;
+            for (const item of data === entity ? [entity] : [data, entity]) {
+                for (const key of parentKeys) {
+                    if (!has(item, key)) continue;
+                    hasParent = true;
+                    const value = own(item, key);
+                    if (value === null) signals.add(false);
+                    // 旧 API 同时给出字符串 Snowflake 和超出安全整数范围的数字。
+                    // 数字只能证明存在父帖，不能与精确字符串 ID 比较。
+                    else if (typeof value === 'number' && Number.isInteger(value) && value > 0) signals.add(true);
+                    else {
+                        const parent = normalizedId(value);
+                        if (parent) { signals.add(true); parents.add(parent); }
+                        else invalidParent = true;
+                    }
+                }
+                for (const key of conversationKeys) {
+                    const conversation = normalizedId(own(item, key));
+                    if (conversation) conversations.add(conversation);
+                }
+            }
+            const conversationId = conversations.size === 1 ? conversations.values().next().value : null;
+            let hasEditControl = false;
+            const validHistories = [];
+            const seenHistories = new Set();
+            const readHistories = holder => {
+                for (const idsKey of ['edit_tweet_ids', 'edit_history_tweet_ids', 'editTweetIds', 'editHistoryTweetIds']) {
+                    if (!has(holder, idsKey)) continue;
+                    hasEditControl = true;
+                    const ids = own(holder, idsKey);
+                    if (!Array.isArray(ids) || seenHistories.has(ids)) continue;
+                    seenHistories.add(ids);
+                    if (ids.length === 0 || ids.length > 100) continue;
+                    const history = new Set();
+                    let complete = true;
+                    for (let index = 0; index < ids.length; index++) {
+                        const editId = normalizedId(own(ids, String(index)));
+                        if (editId) history.add(editId);
+                        else { complete = false; break; }
+                    }
+                    // 一份完整历史必须自己包含当前 ID，不能合并残缺列表凑证据。
+                    if (complete && history.has(id)) validHistories.push(history);
+                }
+            };
+            for (const item of data === entity ? [entity] : [data, entity]) {
+                readHistories(item);
+                for (const key of ['edit_control', 'editControl', 'edit_control_initial', 'editControlInitial']) {
+                    if (!has(item, key)) continue;
+                    hasEditControl = true;
+                    const control = own(item, key);
+                    for (const holder of [control, own(control, 'initial'), own(control, 'edit_control_initial')]) {
+                        readHistories(holder);
+                    }
+                }
+            }
+            // 父帖字段是首选；只有缺失时才以 conversation_id 补证据。
+            // 当前帖/自己的编辑版本是会话根，不能同时有正向父帖证据。
+            if (conversationId === id) signals.add(false);
+            else if (conversationId) {
+                for (const history of validHistories) {
+                    if (history.has(conversationId)) signals.add(false);
+                    else if (!hasParent) signals.add(true);
+                }
+                if (!hasParent && !hasEditControl) signals.add(true);
+            }
+            const conflict = signals.size > 1 || parents.size > 1 || conversations.size > 1 || parents.has(id);
+            return {
+                id, reply: conflict || invalidParent ? null : signals.size === 1 ? signals.values().next().value : null,
+                replyTo: parents.size === 1 ? parents.values().next().value : null,
+                conversationId, conflict
+            };
+        }
+
+        function remember(sample, operation) {
+            const previous = states.get(sample.id);
+            const mask = sample.conflict ? 3 : sample.reply === true ? 1 : sample.reply === false ? 2 : 0;
+            const combined = previous ? previous.mask | mask : mask;
+            let conflict = sample.conflict || !!(previous && previous.conflict) || combined === 3;
+            if (previous && previous.replyTo && sample.replyTo && previous.replyTo !== sample.replyTo) conflict = true;
+            if (previous && previous.conversationId && sample.conversationId && previous.conversationId !== sample.conversationId) conflict = true;
+            const state = {
+                mask: combined, conflict,
+                replyTo: sample.replyTo || (previous && previous.replyTo) || null,
+                conversationId: sample.conversationId || (previous && previous.conversationId) || null
+            };
+            states.delete(sample.id);
+            states.set(sample.id, state);
+            records.delete(sample.id);
+            records.set(sample.id, {
+                id: sample.id, reply: conflict ? null : combined === 1 ? true : combined === 2 ? false : null,
+                replyTo: conflict ? null : state.replyTo, conversationId: state.conversationId,
+                source: 'network:' + operation, time: now(), conflict
+            });
+            while (records.size > MAX_RECORDS) {
+                const oldest = records.keys().next().value;
+                records.delete(oldest);
+                states.delete(oldest);
+            }
+        }
+
+        function capture(json, operation) {
+            const source = allowedOperations.has(operation) ? operation : 'capture';
+            const stack = [{ value: json, depth: 0, skipClassify: false }];
+            const seen = new WeakSet();
+            let visited = 0;
+            let captured = 0;
+            let budgetHit = false;
+            let depthHit = false;
+            try {
+                while (stack.length) {
+                    if (visited >= MAX_NODES) { budgetHit = true; break; }
+                    const current = stack.pop();
+                    if (!object(current.value) || seen.has(current.value)) continue;
+                    seen.add(current.value);
+                    visited++;
+                    const typename = own(current.value, '__typename');
+                    // 墓碑/不可用对象的 legacy 不能被重新当成无 typename 的帖子。
+                    if (typeof typename === 'string' && (
+                        (/^Tweet/.test(typename) && typename !== 'Tweet' && typename !== 'TweetWithVisibilityResults') ||
+                        /(?:Tombstone|Unavailable|Deleted|Suspended|NotFound)/.test(typename)
+                    )) continue;
+                    // legacy 的关系必须连同父实体的 edit_control 一起判断。
+                    // 仍继续查找它下面独立的 quoted/retweeted 帖子实体。
+                    const sample = current.skipClassify ? null : classify(current.value);
+                    if (sample) { remember(sample, source); captured++; }
+                    if (current.depth >= MAX_DEPTH) { depthHit = true; continue; }
+                    let childCount = 0;
+                    if (Array.isArray(current.value)) {
+                        for (let index = 0; index < Math.min(current.value.length, MAX_NODES); index++) {
+                            const child = own(current.value, String(index));
+                            if (!object(child)) continue;
+                            if (stack.length >= MAX_NODES) { budgetHit = true; break; }
+                            stack.push({ value: child, depth: current.depth + 1, skipClassify: false });
+                        }
+                        if (current.value.length > MAX_NODES) budgetHit = true;
+                    } else {
+                        for (const key in current.value) {
+                            if (!has(current.value, key) || ignoredKeys.has(key)) continue;
+                            if (++childCount > MAX_NODES || stack.length >= MAX_NODES) { budgetHit = true; break; }
+                            const child = own(current.value, key);
+                            if (object(child)) stack.push({ value: child, depth: current.depth + 1, skipClassify: key === 'legacy' });
+                        }
+                    }
+                }
+            } catch (_) { status.parseFailures++; }
+            if (budgetHit) status.nodeBudgetExceeded++;
+            if (depthHit) status.depthBudgetExceeded++;
+            status.captures += captured;
+            return captured;
+        }
+
+        function lookup(value) {
+            const id = normalizedId(value);
+            const record = id && records.get(id);
+            if (!record) return null;
+            records.delete(id);
+            records.set(id, record);
+            return record;
+        }
+
+        function install() {
+            if (status.installed) return diagnostics();
+            status.installed = true;
+            const target = pageWindow || localWindow;
+            let base;
+            let URLCtor;
+            let promiseThen;
+            try {
+                URLCtor = localWindow.URL || target.URL;
+                base = new URLCtor(target.location.href);
+                if (!/^(?:www\.)?(?:x|twitter)\.com$/i.test(base.hostname)) return diagnostics();
+                promiseThen = (target.Promise || localWindow.Promise).prototype.then;
+            } catch (_) { status.hookFailures++; return diagnostics(); }
+            const requestInfo = value => {
+                try {
+                    let raw = typeof value === 'string' ? value : null;
+                    if (!raw && value && typeof value === 'object') {
+                        for (const constructor of [target.Request, localWindow.Request]) {
+                            if (!constructor || !constructor.prototype) continue;
+                            const getter = Object.getOwnPropertyDescriptor(constructor.prototype, 'url');
+                            if (!getter || typeof getter.get !== 'function') continue;
+                            try { raw = Reflect.apply(getter.get, value, []); break; } catch (_) { /* another realm */ }
+                        }
+                        if (!raw && value instanceof URLCtor) raw = value.href;
+                    }
+                    if (typeof raw !== 'string') return null;
+                    const url = new URLCtor(raw, base.href);
+                    if (url.origin !== base.origin) return null;
+                    const match = /^\/i\/api\/graphql\/[^/]+\/([^/]+)\/?$/.exec(url.pathname);
+                    return match && allowedOperations.has(match[1]) ? { operation: match[1] } : null;
+                } catch (_) { return null; }
+            };
+            const requestMethod = value => {
+                if (!value || typeof value !== 'object') return 'GET';
+                for (const constructor of [target.Request, localWindow.Request]) {
+                    if (!constructor || !constructor.prototype) continue;
+                    const getter = Object.getOwnPropertyDescriptor(constructor.prototype, 'method');
+                    if (!getter || typeof getter.get !== 'function') continue;
+                    try { return Reflect.apply(getter.get, value, []); } catch (_) { /* another realm */ }
+                }
+                return 'GET';
+            };
+            const optionMethod = value => {
+                if (!value || (typeof value !== 'object' && typeof value !== 'function')) return { present: false };
+                let current = value;
+                try {
+                    // RequestInit 可以从原型继承 method；不调用该属性的 getter。
+                    for (let depth = 0; current && depth < 8; depth++) {
+                        const descriptor = Object.getOwnPropertyDescriptor(current, 'method');
+                        if (descriptor) return Object.prototype.hasOwnProperty.call(descriptor, 'value')
+                            ? { present: descriptor.value !== undefined, method: descriptor.value }
+                            : { present: true, method: null };
+                        current = Object.getPrototypeOf(current);
+                    }
+                } catch (_) { return { present: true, method: null }; }
+                return current ? { present: true, method: null } : { present: false };
+            };
+            const observePromise = (promise, success, failure) => {
+                try { Reflect.apply(promiseThen, promise, [success, failure]); return true; }
+                catch (_) { status.hookFailures++; return false; }
+            };
+            const begin = () => { status.pendingRequests++; status.lastRequestAt = now(); };
+            const finish = () => { status.pendingRequests = Math.max(0, status.pendingRequests - 1); };
+            const responseArrived = () => { status.responses++; status.lastResponseAt = now(); };
+            const canWrite = (owner, key) => {
+                try {
+                    const descriptor = Object.getOwnPropertyDescriptor(owner, key);
+                    return !descriptor || (Object.prototype.hasOwnProperty.call(descriptor, 'value') && descriptor.writable);
+                } catch (_) { return false; }
+            };
+            const replace = (owner, key, value) => {
+                try {
+                    if (!canWrite(owner, key)) return false;
+                    return Reflect.set(owner, key, value) && owner[key] === value;
+                } catch (_) { return false; }
+            };
+            try {
+                const originalFetch = target.fetch;
+                if (typeof originalFetch === 'function') {
+                    const wrappedFetch = function (...args) {
+                        const result = Reflect.apply(originalFetch, this, args);
+                        let info = requestInfo(args[0]);
+                        // 只观察 GET/POST；不读取请求头或请求体。
+                        const methodOption = optionMethod(args[1]);
+                        const method = methodOption.present ? methodOption.method : requestMethod(args[0]);
+                        if (typeof method !== 'string' || !/^(?:GET|POST)$/i.test(method)) info = null;
+                        if (info) {
+                            begin();
+                            const attached = observePromise(result, response => {
+                                responseArrived();
+                                try {
+                                    if (response.url && !requestInfo(response.url)) { finish(); return; }
+                                    const clone = Reflect.apply(response.clone, response, []);
+                                    const parsing = Reflect.apply(clone.json, clone, []);
+                                    if (!observePromise(parsing, json => {
+                                        try { capture(json, info.operation); } finally { finish(); }
+                                    }, () => { status.parseFailures++; finish(); })) finish();
+                                } catch (_) { status.parseFailures++; finish(); }
+                            }, () => { finish(); });
+                            if (!attached) finish();
+                        }
+                        return result;
+                    };
+                    status.fetchInstalled = replace(target, 'fetch', wrappedFetch);
+                    if (!status.fetchInstalled) status.hookFailures++;
+                } else status.hookFailures++;
+            } catch (_) { status.hookFailures++; }
+            try {
+                const prototype = target.XMLHttpRequest && target.XMLHttpRequest.prototype;
+                if (prototype && typeof prototype.open === 'function' && typeof prototype.send === 'function') {
+                    const originalOpen = prototype.open;
+                    const originalSend = prototype.send;
+                    const addListener = prototype.addEventListener;
+                    const metadata = new WeakMap();
+                    const listeners = new WeakMap();
+                    const stop = xhr => {
+                        const meta = metadata.get(xhr);
+                        if (meta && meta.active) { meta.active = false; finish(); }
+                    };
+                    const attach = xhr => {
+                        let flags = listeners.get(xhr);
+                        if (!flags) { flags = { load: false, end: false }; listeners.set(xhr, flags); }
+                        if (!flags.load) {
+                            Reflect.apply(addListener, xhr, ['load', function () {
+                                const meta = metadata.get(this);
+                                if (!meta || !meta.info) return;
+                                responseArrived();
+                                try {
+                                    if (this.responseURL && !requestInfo(this.responseURL)) return;
+                                    const type = this.responseType;
+                                    const json = type === 'json' ? this.response : type === '' || type === 'text' ? JSON.parse(this.responseText) : null;
+                                    if (json) capture(json, meta.info.operation);
+                                } catch (_) { status.parseFailures++; }
+                            }]);
+                            flags.load = true;
+                        }
+                        if (!flags.end) {
+                            Reflect.apply(addListener, xhr, ['loadend', function () { stop(this); }]);
+                            Reflect.apply(addListener, xhr, ['abort', function () { stop(this); }]);
+                            flags.end = true;
+                        }
+                        return flags.end;
+                    };
+                    const wrappedOpen = function (...args) {
+                        const result = Reflect.apply(originalOpen, this, args);
+                        // open 复用对象时，之前请求通常已同步收到 abort/loadend。
+                        stop(this);
+                        let info = requestInfo(args[1]);
+                        if (typeof args[0] !== 'string' || !/^(?:GET|POST)$/i.test(args[0])) info = null;
+                        const meta = { info, active: false, canTrack: false };
+                        metadata.set(this, meta);
+                        if (info) {
+                            try { meta.canTrack = attach(this); } catch (_) { status.hookFailures++; }
+                        }
+                        return result;
+                    };
+                    const wrappedSend = function (...args) {
+                        const meta = metadata.get(this);
+                        const started = !!(meta && meta.info && meta.canTrack && !meta.active);
+                        if (started) { meta.active = true; begin(); }
+                        try { return Reflect.apply(originalSend, this, args); }
+                        catch (error) { if (started) stop(this); throw error; }
+                    };
+                    if (typeof addListener === 'function' && canWrite(prototype, 'open') && canWrite(prototype, 'send')) {
+                        const openPatched = replace(prototype, 'open', wrappedOpen);
+                        const sendPatched = openPatched && replace(prototype, 'send', wrappedSend);
+                        status.xhrInstalled = openPatched && sendPatched;
+                        if (!status.xhrInstalled && openPatched) replace(prototype, 'open', originalOpen);
+                        if (!status.xhrInstalled) status.hookFailures++;
+                    } else status.hookFailures++;
+                } else status.hookFailures++;
+            } catch (_) { status.hookFailures++; }
+            return diagnostics();
+        }
+
+        function diagnostics() { return Object.assign({}, status, { cached: records.size }); }
+        return { records, lookup, classify, capture, install, diagnostics };
+    }
+    // XGW_TIMELINE_EVIDENCE_END
     // CONFIG（全局常量）
     // =====================
 
@@ -51,7 +457,7 @@
         try { return localStorage.getItem('xpc_debug') === '1'; } catch (err) { return false; }
     })();
 
-    const VERSION = '0.3.15';
+    const VERSION = '0.3.16';
     const SCRIPT_NAME = 'X GeWu';
 
     const CONFIG = {
@@ -60,6 +466,7 @@
         REMOVE_WAIT_MS: 10000,     // 等待帖子从 DOM 中消失
         SCROLL_WAIT_MS: 6000,      // 滚动后等待新内容加载
         SCROLL_REWAIT_MS: 3000,    // 连续第二次"没有新内容"时的等待（加快到底判定）
+        SCROLL_END_GRACE_MS: 15000, // 无加载动画时也等待迟到的数据，不把三轮空结果直接当到底
         SCROLL_SETTLE_MS: 180,     // 滚动已前进时只短暂等待渲染，不空等完整加载超时
         SCROLL_STALL_MS: 45000,    // 持续加载/滚动但没有新增扫描结果时暂停，保留已收集内容
         RETRY_DELAY_MS: 1000,      // 单条失败后、重试前的等待（需求 18）
@@ -212,6 +619,7 @@
         taskContext: null,       // 启动时的账号与完整 URL
         taskTriedIds: new Set(), // 本次任务已处理（允许下一次任务重试未提交的失败）
         unknownElements: new WeakSet(),
+        pendingPostCount: 0,       // 无稳定外层 ID 的占位结构不参与帖子计数
         ownedMenu: null,
         ownedDialog: null,
         sessionUser: null,
@@ -942,6 +1350,11 @@
             }
             if (ids.includes(id)) {
                 if (ids.some((other) => other !== id)) { conflict = true; continue; }
+                const derived = timelineEvidence.classify(value);
+                if (derived && derived.id === id) {
+                    if (derived.conflict) conflict = true;
+                    if (typeof derived.reply === 'boolean') signals.add(derived.reply);
+                }
                 for (const source of [value, legacy]) {
                     for (const key of parentKeys) {
                         const parent = ownData(source, key);
@@ -1046,7 +1459,10 @@
             const socialText = social ? getItemText(social) : '';
             const activeRepost = ownElements(articleEl, SELECTORS.unretweet).filter(isVisible).length === 1;
             const promoted = isPromotedArticle(articleEl);
-            const metadata = replyMetadata(articleEl, info.id);
+            const loaded = timelineEvidence.lookup(info.id);
+            const metadata = loaded && (loaded.conflict || typeof loaded.reply === 'boolean')
+                ? { isReply: loaded.reply, conflict: loaded.conflict, exhausted: false }
+                : replyMetadata(articleEl, info.id);
             const replyContext = isReplyContext(articleEl);
             const replyConflict = metadata.conflict || (metadata.isReply === false && replyContext);
             const isReply = !replyConflict && (metadata.isReply === true || replyContext);
@@ -1222,6 +1638,7 @@
         const root = document.querySelector(SELECTORS.primaryColumn);
         if (!root) return [];
         const eligible = [];
+        state.pendingPostCount = 0;
         const articles = root.querySelectorAll(SELECTORS.article);
 
         for (const articleEl of articles) {
@@ -1236,20 +1653,14 @@
                 if (articleEl.parentElement && articleEl.parentElement.closest('article')) continue;
                 if (!state.unknownElements.has(articleEl)) {
                     state.unknownElements.add(articleEl);
-                    state.stats.scanned++;
-                    state.stats.skipped++;
-                    state.byType.unknown++;
-                    const reason = '无法识别外层作者/时间戳，结构不确定';
-                    state.skipReasonCounts[reason] = (state.skipReasonCounts[reason] || 0) + 1;
-                    logDev(reason);
+                    logDev('等待外层作者/时间戳补齐，暂无稳定 ID，不累计为已扫描帖子');
                 }
+                state.pendingPostCount++;
                 continue;
             }
-            // 同一占位节点补齐外层头部后，用 ID 记录替换原匿名 unknown 计数。
+            // 占位结构在稳定 ID 出现后才进入统一去重记录。
             if (state.unknownElements.has(articleEl)) {
                 state.unknownElements.delete(articleEl);
-                state.stats.scanned--; state.stats.skipped--; state.byType.unknown--;
-                adjustSkipReason('无法识别外层作者/时间戳，结构不确定', -1);
             }
             // 已处理条目的历史候选统计保留；它们不会再次成为可执行目标。
             if (state.seenIds.has(post.id) && (state.attemptedIds.has(post.id) || state.taskTriedIds.has(post.id))) continue;
@@ -1275,13 +1686,27 @@
         return Number(target ? target.scrollTop : window.scrollY) || 0;
     }
 
+    function postViewportCovered(root, target) {
+        const articles = Array.from(root.querySelectorAll(SELECTORS.article)).filter((article) =>
+            !(article.parentElement && article.parentElement.closest('article')) && isVisible(article));
+        if (!articles.length) return false;
+        const lastRect = articles[articles.length - 1].getBoundingClientRect();
+        const view = target ? target.getBoundingClientRect() : null;
+        const viewHeight = target ? target.clientHeight : window.innerHeight;
+        const viewBottom = view ? Math.min(view.bottom, view.top + viewHeight) : viewHeight;
+        // 虚拟列表还没渲染当前窗口时，旧节点的底部已滑出可视区；不要继续跳下一屏。
+        return lastRect.bottom >= viewBottom - Math.max(32, viewHeight * 0.1);
+    }
+
     function postTimelineSignals(root) {
         if (!root) return { loading: true, error: '' };
         const outsidePosts = (node) => !node.closest('article, aside, [data-testid="UserCell"]') && isVisible(node);
         const errors = Array.from(root.querySelectorAll('[data-testid="retry"], [data-testid="error-detail"], [data-testid="error-message"]'))
             .filter(outsidePosts);
         const loading = Array.from(root.querySelectorAll('[role="progressbar"], [data-testid="spinner"]')).some(outsidePosts);
-        return { loading, error: errors.length ? truncate(getItemText(errors[0]) || '时间线加载失败', 100) : '' };
+        const network = timelineEvidence.diagnostics();
+        return { loading: loading || network.pendingRequests > 0,
+            error: errors.length ? truncate(getItemText(errors[0]) || '时间线加载失败', 100) : '' };
     }
 
     function hasUnscannedPosts(root) {
@@ -1304,7 +1729,8 @@
     }
 
     function newPostScanProgress() {
-        return { scanned: state.stats.scanned, revision: state.scanRevision, lastProgressAt: Date.now(), emptyRounds: 0 };
+        return { scanned: state.stats.scanned, revision: state.scanRevision, lastProgressAt: Date.now(),
+            emptySince: 0, emptyRounds: 0 };
     }
 
     function recordPostScanProgress(progress) {
@@ -1313,6 +1739,7 @@
             progress.revision = state.scanRevision;
             progress.lastProgressAt = Date.now();
             progress.emptyRounds = 0;
+            progress.emptySince = 0;
         }
     }
 
@@ -1321,15 +1748,20 @@
             autoPause('X 时间线加载失败：' + result.error + '。已保留扫描结果，请在页面恢复后点击继续。');
             return false;
         }
-        if (result.newPosts) { progress.emptyRounds = 0; return false; }
+        if (result.newPosts) { progress.emptyRounds = 0; progress.emptySince = 0; return false; }
         if (Date.now() - progress.lastProgressAt >= CONFIG.SCROLL_STALL_MS) {
             autoPause('X 时间线长时间没有加载新帖子。已保留扫描结果，请检查页面，加载恢复后点击继续。');
             return false;
         }
         // Scrolling is useful for reaching the loading sentinel, but is not new-content progress.
-        if (result.loading || result.advanced) progress.emptyRounds = 0;
-        else progress.emptyRounds++;
-        return progress.emptyRounds >= 3;
+        if (result.loading || result.advanced) {
+            progress.emptyRounds = 0; progress.emptySince = 0;
+        } else {
+            progress.emptyRounds++;
+            if (!progress.emptySince) progress.emptySince = Date.now();
+        }
+        return progress.emptyRounds >= 3 && progress.emptySince > 0
+            && Date.now() - progress.emptySince >= CONFIG.SCROLL_END_GRACE_MS;
     }
 
     // Loading, scrolling and genuinely new posts are separate outcomes.
@@ -1354,7 +1786,8 @@
             if (signals.error) return { newPosts: false, advanced: false, ...signals };
             // 时间线已滚动但仍是同一批已加载内容：短暂让出渲染时间后继续前进，
             // 不能每一步都空等 6 秒。到页面底部无法前进时才等待新内容。
-            if (postScrollPosition(target) > beforeY + 2 && Date.now() - startedAt >= CONFIG.SCROLL_SETTLE_MS) {
+            if (postScrollPosition(target) > beforeY + 2 && Date.now() - startedAt >= CONFIG.SCROLL_SETTLE_MS
+                && root && postViewportCovered(root, target)) {
                 return { newPosts: false, advanced: true, ...signals };
             }
             return false;
@@ -1662,6 +2095,7 @@
         state.dryRunTriedIds = new Set();
         state.taskTriedIds = new Set();
         state.unknownElements = new WeakSet();
+        state.pendingPostCount = 0;
         state.consecutiveFailures = 0;
         state.actionBlockReason = '';
         // attemptedIds 仅保存实际提交的操作，未提交的失败允许在下次任务重试。
@@ -1767,6 +2201,24 @@
     async function runScan() {
         const initialTarget = postScrollTarget();
         const startScrollY = postScrollPosition(initialTarget);
+        if (startScrollY > 2) {
+            log('从时间线顶部开始核对，结束后恢复原浏览位置');
+            try {
+                const signature = () => {
+                    const root = document.querySelector(SELECTORS.primaryColumn);
+                    return root ? Array.from(root.querySelectorAll(SELECTORS.article))
+                        .map((article) => { const main = mainStatus(article); return main ? main.info.id : ''; }).join(',') : '';
+                };
+                const previousIds = signature();
+                if (initialTarget) initialTarget.scrollTop = 0;
+                else window.scrollTo(0, 0);
+                await waitForCondition(() => {
+                    const root = document.querySelector(SELECTORS.primaryColumn);
+                    return postScrollPosition(initialTarget) <= 2 && !postTimelineSignals(root).loading
+                        && signature() !== previousIds;
+                }, CONFIG.SCROLL_WAIT_MS, '等待顶部时间线恢复', () => !canAct());
+            } catch (err) { logDev('回到时间线顶部失败，继续核对当前加载内容'); }
+        }
         let progress = newPostScanProgress();
         while (taskActive()) {
             const wasPaused = state.paused;
@@ -1783,7 +2235,7 @@
             }
             const result = await scrollAndWaitForNew(progress.emptyRounds > 0 ? CONFIG.SCROLL_REWAIT_MS : 0);
             if (!taskActive() || state.paused) continue;
-            if (postScanReachedEnd(progress, result)) { log('连续三次未发现新帖子，扫描结束'); break; }
+            if (postScanReachedEnd(progress, result)) { log('时间线连续等待后仍无新增帖子，本次扫描结束'); break; }
         }
         if (!state.stopRequested && location.href === state.taskContext.href) {
             try {
@@ -1834,7 +2286,7 @@
                 }
                 const result = await scrollAndWaitForNew(progress.emptyRounds > 0 ? CONFIG.SCROLL_REWAIT_MS : 0);
                 if (!taskActive() || state.paused) continue;
-                if (postScanReachedEnd(progress, result)) { log('连续三次未发现新帖子，没有更多可处理内容'); break; }
+                if (postScanReachedEnd(progress, result)) { log('时间线连续等待后仍无新增帖子，没有更多可处理内容'); break; }
                 continue;
             }
             progress.emptyRounds = 0;
@@ -2523,7 +2975,7 @@
         const stats = el('div', 'xpc-stats');
         const statNodes = {};
         const statDefs = [
-            ['scanned', '已扫描'], ['matched', '符合条件'], ['deleted', '已完成'],
+            ['scanned', '已扫描（含父帖）'], ['matched', '符合条件'], ['deleted', '已完成'],
             ['wouldDelete', '模拟(DRY)'], ['skipped', '跳过'], ['failed', '失败/待确认'],
         ];
         for (const def of statDefs) {
@@ -2694,6 +3146,7 @@
             profileVisit: getProfileVisitDiagnostics(),
             following: getFollowingDiagnostics(),
             skipReasons: state.skipReasonCounts, autoPauseReason: state.autoPauseReason,
+            timelineEvidence: timelineEvidence.diagnostics(), pendingPostCount: state.pendingPostCount,
             actionBlockReason: state.actionBlockReason,
             attemptedIds: Array.from(state.attemptedIds), logs: state.logs,
         };
@@ -2820,6 +3273,10 @@
             ui.countLine.textContent = '候选（已扫描）' + counts.candidate + ' ｜ 本次已删除 ' + counts.deleted
                 + ' ｜ 待处理 ' + counts.remaining + '\n模拟 ' + counts.simulated + ' ｜ 累计确认成功 ' + counts.total
                 + (candidateLimitReached() ? ' ｜ 已达候选上限' : '');
+            const pendingReplies = state.skipReasonCounts['回复关系暂未确认(已跳过)'] || 0;
+            if (pendingReplies) ui.countLine.textContent += '\n回复关系待确认 ' + pendingReplies
+                + (timelineEvidence.diagnostics().cached === 0 ? '；请保存新版后刷新 X，再重新扫描' : '');
+            if (state.pendingPostCount) ui.countLine.textContent += ' ｜ 帖子结构待补齐 ' + state.pendingPostCount;
         }
         if (ui.skipLine) {
             ui.skipLine.textContent = skipReasonSummary();
