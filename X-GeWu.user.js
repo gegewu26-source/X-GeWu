@@ -2,7 +2,7 @@
 // @name         X GeWu
 // @name:zh-CN   X GeWu
 // @namespace    https://x.com/gegewu203
-// @version      0.3.14
+// @version      0.3.15
 // @description  Clean your own X posts by date, highlight following relationships and unfollow accounts without a visible follow-back indicator. Dry Run, verified actions and quotas. Visits @gegewu203 on first use, then at most once every 15 days.
 // @description:zh-CN  按日期清理本人的 X 帖子；关注列表标注回关关系、记录观察到的互关历史并批量取关未显示回关的账号。默认模拟、保留名单与操作上限；首次使用跳转至 @gegewu203 主页，之后每 15 天最多一次。
 // @author       GeWu (@gegewu203)
@@ -13,6 +13,8 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addValueChangeListener
+// @grant        unsafeWindow
+// @sandbox      JavaScript
 // @noframes
 // @run-at       document-idle
 // ==/UserScript==
@@ -49,7 +51,7 @@
         try { return localStorage.getItem('xpc_debug') === '1'; } catch (err) { return false; }
     })();
 
-    const VERSION = '0.3.14';
+    const VERSION = '0.3.15';
     const SCRIPT_NAME = 'X GeWu';
 
     const CONFIG = {
@@ -235,6 +237,9 @@
 
         // 去重（需求 14）
         seenIds: new Set(),        // 本次任务扫描过去重的 id（防重复统计）
+        scanRecords: new Map(),    // ID 去重与判定分开；后补证据可更新原统计
+        scanRevision: 0,
+        candidateLimitHit: false,  // 达到上限后不因撤回候选而自动补扫
         candidateIds: new Set(),   // 本次收集的候选；达到上限后不再扩充，即使有操作失败
         attemptedIds: new Set(),   // 已提交的操作 ID —— 页面会话内不重复提交
         dryRunTriedIds: new Set(), // Dry Run 演练过的 id（每次任务重置，避免演练卡死同一帖）
@@ -793,9 +798,11 @@
 
     // 正文中的 status URL 是普通链接；只把独立引用卡片算作 Quote。
     function hasForeignStatusLink(articleEl, mainId) {
-        if (articleEl.querySelector(SELECTORS.quote)) return true;
+        if (Array.from(articleEl.querySelectorAll(SELECTORS.quote))
+            .some((card) => card.closest(SELECTORS.article) === articleEl)) return true;
         const links = articleEl.querySelectorAll(SELECTORS.statusLink);
         for (const link of links) {
+            if (link.closest(SELECTORS.article) !== articleEl) continue;
             if (link.closest(SELECTORS.tweetText) || link.closest(SELECTORS.socialContext)) continue;
             const info = parseStatusHref(link.getAttribute('href'));
             if (info && info.id !== mainId && link.querySelector('time')) return true;
@@ -805,24 +812,194 @@
         return false;
     }
 
-    // 回复识别："Replying to @x" 上下文行在 tweetText 的前一个兄弟节点
-    //（没有回复上下文时，前一个兄弟是头部行，头部行必含 /status/ 时间戳链接 -> 排除）
-    function isReplyContext(articleEl, textEl) {
-        if (ownElements(articleEl, SELECTORS.replyingTo).length) return true;
-        let node = textEl;
-        while (node && node !== articleEl) {
-            let prev = node.previousElementSibling;
-            while (prev) {
-                if (prev.matches(SELECTORS.userName) || prev.querySelector(SELECTORS.userName)) break;
-                const txt = getItemText(prev);
-                if (txt && txt.length <= 140 && !prev.matches(SELECTORS.tweetText)
-                    && !prev.querySelector(SELECTORS.tweetText)
-                    && /^(?:replying to\b|回复|回覆|返信|답글)/i.test(txt)) return true;
-                prev = prev.previousElementSibling;
+    // 只读自有数据属性，不运行页面 getter，也不调用 React/站点函数。
+    function ownData(object, key) {
+        if (!object || typeof object !== 'object') return undefined;
+        try {
+            const property = Object.getOwnPropertyDescriptor(object, key);
+            return property && Object.prototype.hasOwnProperty.call(property, 'value') ? property.value : undefined;
+        } catch (err) { return undefined; }
+    }
+
+    function exactTweetId(value) {
+        if (typeof value === 'string' && /^[1-9]\d*$/.test(value)) return value;
+        return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? String(value) : '';
+    }
+
+    // 油猴的隔离环境可能看不到页面扩展属性；从 unsafeWindow 取得同一外层帖子。
+    function pageArticleForMetadata(articleEl, id) {
+        try {
+            if (typeof unsafeWindow === 'undefined' || !unsafeWindow.document) return articleEl;
+            const pageDoc = unsafeWindow.document;
+            if (pageDoc === document) return articleEl;
+            const root = pageDoc.querySelector(SELECTORS.primaryColumn);
+            if (!root) return articleEl;
+            for (const link of root.querySelectorAll('a[href*="/status/' + id + '"]')) {
+                const candidate = link.closest(SELECTORS.article);
+                const main = candidate && mainStatus(candidate);
+                if (main && main.info.id === id) return candidate;
             }
-            node = node.parentElement;
+        } catch (err) { /* 无法跨环境读取时仍可识别明确的 DOM 上下文 */ }
+        return articleEl;
+    }
+
+    // 会话列表可省略 Replying to：读取与外层 ID 一致的帖子实体中的父帖字段。
+    // 不根据 Replies 标签页、正文 @mention 或另一帖的回复字段推测。
+    function replyMetadata(articleEl, id) {
+        const roots = [];
+        const fiberRoots = [];
+        const fibers = new Set();
+        const committedFiber = (candidate) => {
+            const rootFor = (start) => {
+                const seen = new Set();
+                let top = start;
+                for (let depth = 0; top && depth < 80; depth++) {
+                    if (seen.has(top)) return null;
+                    seen.add(top);
+                    const parent = ownData(top, 'return');
+                    if (!parent) return top;
+                    top = parent;
+                }
+                return null;
+            };
+            const top = rootFor(candidate);
+            const current = top && ownData(ownData(top, 'stateNode'), 'current');
+            // 旧 React/简化数据没有 HostRoot 时只读现有链；有 root 时必须确认提交分支。
+            if (!current) return candidate;
+            const alternate = ownData(candidate, 'alternate');
+            if (!alternate) return current === top ? candidate : null;
+            let a = candidate;
+            let b = alternate;
+            const seen = new Set();
+            for (let depth = 0; depth < 80; depth++) {
+                if (seen.has(a) || seen.has(b)) return null;
+                seen.add(a); seen.add(b);
+                const parentA = ownData(a, 'return');
+                const parentB = ownData(b, 'return');
+                if (!parentA && !parentB) return current === a ? candidate : current === b ? alternate : null;
+                if (!parentA || !parentB || parentA === parentB || ownData(parentA, 'alternate') !== parentB) return null;
+                const sharedChild = ownData(parentA, 'child');
+                // React bailout 可让新旧父节点复用同一 child，此时 return 路径不能证明提交分支。
+                if (sharedChild && sharedChild === ownData(parentB, 'child')) return null;
+                a = parentA; b = parentB;
+            }
+            return null;
+        };
+        const pageArticle = pageArticleForMetadata(articleEl, id);
+        for (let node = pageArticle, depth = 0; node && depth < 6; node = node.parentElement, depth++) {
+            if (node.matches(SELECTORS.primaryColumn) || node === node.ownerDocument.body) break;
+            let keys;
+            try { keys = Object.getOwnPropertyNames(node); } catch (err) { continue; }
+            for (const key of keys) {
+                if (/^__reactProps\$/.test(key)) roots.push(ownData(node, key));
+                if (!/^__react(?:Fiber|InternalInstance)\$/.test(key)) continue;
+                for (let fiber = committedFiber(ownData(node, key)), hops = 0; fiber && hops < 12; fiber = ownData(fiber, 'return'), hops++) {
+                    if (fibers.has(fiber)) break;
+                    fibers.add(fiber);
+                    const host = ownData(fiber, 'stateNode');
+                    if (host && host.nodeType === 1 && (host.matches(SELECTORS.primaryColumn)
+                        || host === host.ownerDocument.body)) break;
+                    const current = ownData(fiber, 'memoizedProps');
+                    fiberRoots.push(current == null ? ownData(fiber, 'pendingProps') : current);
+                }
+            }
+            if (node.matches('[data-testid="cellInnerDiv"]')) break;
         }
-        return false;
+
+        const queue = roots.filter((value) => value && typeof value === 'object').map((value) => ({ value, depth: 0 }));
+        const visited = new Set();
+        const signals = new Set();
+        const parentIds = new Set();
+        const idKeys = ['rest_id', 'id_str', 'idStr', 'id'];
+        const parentKeys = ['in_reply_to_status_id_str', 'inReplyToStatusIdStr', 'in_reply_to_status_id', 'inReplyToStatusId'];
+        const ignored = new Set(['_owner', '_store', 'store', 'context', 'memoizedState', 'stateNode',
+            'alternate', 'return', 'child', 'sibling', 'user', 'core', 'entities', 'extended_entities']);
+        const priorityKeys = ['tweet', 'tweet_results', 'tweetResult', 'result', 'legacy', 'props',
+            'data', 'content', 'itemContent', 'item', 'entry', 'children', 'status'];
+        const pageWindow = pageArticle.ownerDocument.defaultView;
+        let conflict = false;
+        let exhausted = false;
+        let usedFibers = false;
+        for (let cursor = 0; visited.size < 500; cursor++) {
+            if (cursor >= queue.length) {
+                // __reactProps 是 DOM 的当前 props；缓存 fiber 的旧 props 不能覆盖它。
+                if (usedFibers || signals.size || conflict) break;
+                usedFibers = true;
+                queue.push(...fiberRoots.filter((value) => value && typeof value === 'object')
+                    .map((value) => ({ value, depth: 0 })));
+                if (cursor >= queue.length) break;
+            }
+            const { value, depth } = queue[cursor];
+            if (visited.has(value)) continue;
+            visited.add(value);
+            // 不遍历 DOM、窗口或 React 状态存储，只遍历数据和元素 props。
+            if (value === window || value === document || value === pageWindow || value === pageArticle.ownerDocument
+                || value instanceof Node || (pageWindow && value instanceof pageWindow.Node)) continue;
+            const legacy = ownData(value, 'legacy');
+            const ids = idKeys.map((key) => exactTweetId(ownData(value, key))).filter(Boolean);
+            if (legacy && typeof legacy === 'object') {
+                ids.push(...idKeys.map((key) => exactTweetId(ownData(legacy, key))).filter(Boolean));
+            }
+            if (ids.includes(id)) {
+                if (ids.some((other) => other !== id)) { conflict = true; continue; }
+                for (const source of [value, legacy]) {
+                    for (const key of parentKeys) {
+                        const parent = ownData(source, key);
+                        if (parent === null) signals.add(false);
+                        else if (typeof parent === 'string' && /^[1-9]\d*$/.test(parent)) {
+                            if (parent === id) conflict = true;
+                            signals.add(true); parentIds.add(parent);
+                        } else if (typeof parent === 'number' && Number.isFinite(parent) && parent > 0 && Number.isInteger(parent)) {
+                            signals.add(true); // 数值 Snowflake 可能丢精度，不用于父帖 ID 比较。
+                        }
+                    }
+                }
+            } else if (ids.length) continue; // 引用作者/父帖/其他实体不能给外层帖子提供证据。
+            if (depth >= 8) {
+                if (priorityKeys.some((key) => typeof ownData(value, key) === 'object' && ownData(value, key))) exhausted = true;
+                continue;
+            }
+            let keys;
+            try {
+                const allKeys = Object.keys(value);
+                const others = allKeys.filter((key) => !priorityKeys.includes(key) && !ignored.has(key));
+                if (others.length > 80) exhausted = true;
+                keys = priorityKeys.concat(others.slice(0, 80));
+            } catch (err) { continue; }
+            for (const key of keys) {
+                if (ignored.has(key)) continue;
+                const child = ownData(value, key);
+                if (child && typeof child === 'object') {
+                    if (queue.length < 1500) queue.push({ value: child, depth: depth + 1 });
+                    else exhausted = true;
+                }
+            }
+        }
+        if (visited.size >= 500) exhausted = true;
+        return { isReply: signals.size === 1 ? signals.has(true) : null,
+            conflict: conflict || signals.size > 1 || parentIds.size > 1, exhausted: exhausted };
+    }
+
+    function isReplyContext(articleEl) {
+        const excluded = SELECTORS.tweetText + ', ' + SELECTORS.userName + ', ' + SELECTORS.quote
+            + ', ' + SELECTORS.media + ', ' + SELECTORS.socialContext
+            + ', [data-testid="card.wrapper"], [data-testid^="card.layout"], [role="group"]';
+        const context = (node) => !node.closest(excluded);
+        if (ownElements(articleEl, SELECTORS.replyingTo).some(context)) return true;
+        return ownElements(articleEl, 'div, span').some((node) => {
+            if (!context(node) || node.querySelector(SELECTORS.userName + ', ' + SELECTORS.tweetText
+                + ', ' + SELECTORS.quote + ', ' + SELECTORS.media + ', time, button')) return false;
+            const text = getItemText(node).replace(/\s+/g, ' ').trim();
+            if (!text || text.length > 240) return false;
+            // 完整平台上下文须带 handle 或个人主页链接；“回复太慢”等普通文字不算。
+            if (!/^(?:replying\s+to\b|回复(?:给|至)?(?=[\s:@])|回覆(?:給|至)?(?=[\s:@])|返信先\s*[:：]?|답글\s*(?:대상|보내기))/i.test(text)) return false;
+            return /@[A-Za-z0-9_]{1,15}\b/.test(text) || Array.from(node.querySelectorAll('a[href]')).some((link) => {
+                try {
+                    const url = new URL(link.getAttribute('href'), location.origin);
+                    return url.origin === location.origin && /^\/[A-Za-z0-9_]{1,15}\/?$/.test(url.pathname);
+                } catch (err) { return false; }
+            });
+        });
     }
 
     function isPromotedArticle(articleEl) {
@@ -866,26 +1043,39 @@
             const textEl = ownElements(articleEl, SELECTORS.tweetText)[0];
             const firstLine = getFirstLine(articleEl);
             const social = ownElements(articleEl, SELECTORS.socialContext)[0];
-            const socialText = social ? getItemText(social) : firstLine;
+            const socialText = social ? getItemText(social) : '';
             const activeRepost = ownElements(articleEl, SELECTORS.unretweet).filter(isVisible).length === 1;
             const promoted = isPromotedArticle(articleEl);
+            const metadata = replyMetadata(articleEl, info.id);
+            const replyContext = isReplyContext(articleEl);
+            const replyConflict = metadata.conflict || (metadata.isReply === false && replyContext);
+            const isReply = !replyConflict && (metadata.isReply === true || replyContext);
+            const hasQuote = hasForeignStatusLink(articleEl, info.id);
+            const isOwner = !!state.currentUser && info.username.toLowerCase() === state.currentUser.toLowerCase();
+            const replyPending = !isReply && metadata.isReply === null && !hasQuote
+                && (metadata.exhausted || (isOwner && state.pageTab === 'replies'));
 
             let type = 'post';
             if (promoted) type = 'unknown';
             else if (REPOSTED_PATTERNS.some((p) => p.test(socialText))
                 || (activeRepost && state.currentUser && info.username.toLowerCase() !== state.currentUser)) type = 'repost';
-            else if (hasForeignStatusLink(articleEl, info.id)) type = 'quote';
-            else if (isReplyContext(articleEl, textEl)) type = 'reply';
+            else if (replyConflict) type = 'unknown';
+            else if (isReply) type = 'reply';
+            else if (hasQuote) type = 'quote';
+            else if (replyPending) type = 'unknown';
 
             return {
                 id: info.id,
                 url: 'https://x.com/' + info.username + '/status/' + info.id,
                 type: type,
+                isReply: isReply,
+                hasQuote: hasQuote,
+                replyReason: replyConflict ? '回复证据冲突' : replyPending ? '回复关系暂未确认' : '',
                 promoted: promoted,
                 text: textEl ? String(textEl.textContent || '').trim() : '',
                 timestamp: timeEl.getAttribute('datetime') || '', // 外层原帖发布时间，用于日期范围筛选
                 username: info.username,
-                isOwner: !!state.currentUser && info.username.toLowerCase() === state.currentUser.toLowerCase(),
+                isOwner: isOwner,
                 deleted: false,
                 skipped: false,
                 firstLine: firstLine,
@@ -956,7 +1146,8 @@
         }
 
         if (!post.isOwner) return { ok: false, reason: '不是当前账号的内容(@' + post.username + ')' };
-        if (post.type === 'unknown') return { ok: false, reason: '类型无法识别(unknown 不删除)' };
+        if (post.type === 'unknown') return { ok: false, reason: post.replyReason
+            ? post.replyReason + '(已跳过)' : '类型无法识别(unknown 不删除)' };
         if (!opts.types[post.type]) return { ok: false, reason: '类型未勾选(' + TYPE_LABELS[post.type] + ')' };
         return dateFilterResult(post, opts);
     }
@@ -967,7 +1158,62 @@
 
     function candidateLimitReached() {
         const limit = activeSettings().maxDelete;
-        return limit > 0 && state.stats.matched >= limit;
+        return limit > 0 && (state.candidateLimitHit || state.stats.matched >= limit);
+    }
+
+    function scanVerdict(post) {
+        const verdict = filterResult(post);
+        if (verdict.ok && state.attemptedIds.has(post.id)) {
+            return { ok: false, reason: '本页面会话已提交过此帖的操作' };
+        }
+        return verdict;
+    }
+
+    function scanRecordKey(post, verdict) {
+        return JSON.stringify([post.type, post.username.toLowerCase(), post.isOwner, post.promoted,
+            post.activeRepost, post.timestamp, verdict.ok, verdict.reason || '']);
+    }
+
+    function adjustSkipReason(reason, amount) {
+        if (!reason) return;
+        const count = (state.skipReasonCounts[reason] || 0) + amount;
+        if (count > 0) state.skipReasonCounts[reason] = count;
+        else delete state.skipReasonCounts[reason];
+    }
+
+    function recordScannedPost(post, verdict) {
+        const previous = state.scanRecords.get(post.id);
+        const key = scanRecordKey(post, verdict);
+        if (previous && previous.key === key) return;
+        if (previous) {
+            state.byType[previous.type]--;
+            if (previous.ok) {
+                state.stats.matched--;
+                state.eligibleByType[previous.type]--;
+                state.candidateIds.delete(post.id);
+            } else {
+                state.stats.skipped--;
+                adjustSkipReason(previous.reason, -1);
+            }
+        } else {
+            state.seenIds.add(post.id);
+            state.stats.scanned++;
+        }
+        state.byType[post.type] = (state.byType[post.type] || 0) + 1;
+        if (verdict.ok) {
+            state.candidateIds.add(post.id);
+            state.stats.matched++;
+            state.eligibleByType[post.type] = (state.eligibleByType[post.type] || 0) + 1;
+            const limit = activeSettings().maxDelete;
+            if (limit > 0 && state.stats.matched >= limit) state.candidateLimitHit = true;
+        } else {
+            state.stats.skipped++;
+            adjustSkipReason(verdict.reason, 1);
+            logDev('跳过 ' + post.id + ': ' + verdict.reason);
+        }
+        state.scanRecords.set(post.id, { key, type: post.type, ok: verdict.ok, reason: verdict.reason || '' });
+        state.scanRevision++;
+        logDev('扫描 ' + post.id + ' 类型=' + post.type + ' owner=' + post.isOwner + ' "' + truncate(post.text, 40) + '"');
     }
 
     // 达到上限后只找回已收集的候选，不登记新 ID、统计或补扫失败条目。
@@ -979,7 +1225,8 @@
         const articles = root.querySelectorAll(SELECTORS.article);
 
         for (const articleEl of articles) {
-            if (candidateLimitReached()) {
+            const limitWasReached = candidateLimitReached();
+            if (limitWasReached) {
                 const main = mainStatus(articleEl);
                 if (!main || !state.candidateIds.has(main.info.id)
                     || state.attemptedIds.has(main.info.id) || state.taskTriedIds.has(main.info.id)) continue;
@@ -998,38 +1245,18 @@
                 }
                 continue;
             }
-
-            if (state.seenIds.has(post.id)) {
-                // 找回同一任务已收集、尚未处理且仍符合条件的候选。
-                if (state.candidateIds.has(post.id) && !state.attemptedIds.has(post.id)
-                    && !state.taskTriedIds.has(post.id) && filterResult(post).ok) {
-                    eligible.push(post);
-                }
-                continue;
+            // 同一占位节点补齐外层头部后，用 ID 记录替换原匿名 unknown 计数。
+            if (state.unknownElements.has(articleEl)) {
+                state.unknownElements.delete(articleEl);
+                state.stats.scanned--; state.stats.skipped--; state.byType.unknown--;
+                adjustSkipReason('无法识别外层作者/时间戳，结构不确定', -1);
             }
-
-            state.seenIds.add(post.id);
-            state.stats.scanned += 1;
-            state.byType[post.type] = (state.byType[post.type] || 0) + 1;
-            logDev('扫描 ' + post.id + ' 类型=' + post.type + ' owner=' + post.isOwner + ' "' + truncate(post.text, 40) + '"');
-
-            const verdict = filterResult(post);
-            if (verdict.ok && state.attemptedIds.has(post.id)) {
-                verdict.ok = false;
-                verdict.reason = '本页面会话已提交过此帖的操作';
-            }
-            if (verdict.ok) {
-                state.candidateIds.add(post.id);
-                state.stats.matched += 1;
-                state.eligibleByType[post.type] = (state.eligibleByType[post.type] || 0) + 1;
-                eligible.push(post);
-                if (candidateLimitReached()) break;
-            } else {
-                state.stats.skipped += 1;
-                post.skipped = true;
-                state.skipReasonCounts[verdict.reason] = (state.skipReasonCounts[verdict.reason] || 0) + 1;
-                logDev('跳过 ' + post.id + ': ' + verdict.reason);
-            }
+            // 已处理条目的历史候选统计保留；它们不会再次成为可执行目标。
+            if (state.seenIds.has(post.id) && (state.attemptedIds.has(post.id) || state.taskTriedIds.has(post.id))) continue;
+            const verdict = scanVerdict(post);
+            recordScannedPost(post, verdict);
+            if (verdict.ok) eligible.push(post);
+            if (!limitWasReached && candidateLimitReached()) break;
         }
         return eligible;
     }
@@ -1062,7 +1289,13 @@
         for (const article of root.querySelectorAll(SELECTORS.article)) {
             if ((article.parentElement && article.parentElement.closest('article')) || !isVisible(article)) continue;
             const main = mainStatus(article);
-            if (main && state.seenIds.has(main.info.id)) continue;
+            if (main && state.seenIds.has(main.info.id)) {
+                if (state.attemptedIds.has(main.info.id) || state.taskTriedIds.has(main.info.id)) continue;
+                const post = parseArticle(article);
+                const previous = state.scanRecords.get(main.info.id);
+                if (post && previous && previous.key !== scanRecordKey(post, scanVerdict(post))) return true;
+                continue;
+            }
             if (!main) { if (!state.unknownElements.has(article)) return true; continue; }
             const post = parseArticle(article);
             if (post ? !state.seenIds.has(post.id) : !state.unknownElements.has(article)) return true;
@@ -1071,12 +1304,13 @@
     }
 
     function newPostScanProgress() {
-        return { scanned: state.stats.scanned, lastProgressAt: Date.now(), emptyRounds: 0 };
+        return { scanned: state.stats.scanned, revision: state.scanRevision, lastProgressAt: Date.now(), emptyRounds: 0 };
     }
 
     function recordPostScanProgress(progress) {
-        if (progress.scanned !== state.stats.scanned) {
+        if (progress.scanned !== state.stats.scanned || progress.revision !== state.scanRevision) {
             progress.scanned = state.stats.scanned;
+            progress.revision = state.scanRevision;
             progress.lastProgressAt = Date.now();
             progress.emptyRounds = 0;
         }
@@ -1421,6 +1655,9 @@
         state.eligibleByType = { post: 0, reply: 0, quote: 0, repost: 0 };
         state.skipReasonCounts = {};
         state.seenIds = new Set();
+        state.scanRecords = new Map();
+        state.scanRevision = 0;
+        state.candidateLimitHit = false;
         state.candidateIds = new Set();
         state.dryRunTriedIds = new Set();
         state.taskTriedIds = new Set();
