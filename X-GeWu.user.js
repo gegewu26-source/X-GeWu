@@ -2,11 +2,13 @@
 // @name         X GeWu
 // @name:zh-CN   X GeWu
 // @namespace    https://x.com/gegewu203
-// @version      0.3.16
+// @version      0.3.17
 // @description  Clean your own X posts by date, highlight following relationships and unfollow accounts without a visible follow-back indicator. Dry Run, verified actions and quotas. Visits @gegewu203 on first use, then at most once every 15 days.
 // @description:zh-CN  按日期清理本人的 X 帖子；关注列表标注回关关系、记录观察到的互关历史并批量取关未显示回关的账号。默认模拟、保留名单与操作上限；首次使用跳转至 @gegewu203 主页，之后每 15 天最多一次。
 // @author       GeWu (@gegewu203)
 // @homepageURL  https://x.com/gegewu203
+// @updateURL    https://raw.githubusercontent.com/gegewu26-source/X-GeWu/main/X-GeWu.user.js
+// @downloadURL  https://raw.githubusercontent.com/gegewu26-source/X-GeWu/main/X-GeWu.user.js
 // @license      MIT
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -43,6 +45,7 @@
     if (window.top !== window.self) return;
     const timelineEvidence = createTimelineEvidence(window,
         typeof unsafeWindow === 'undefined' ? window : unsafeWindow);
+    timelineEvidence.subscribe(updateLatePostEvidence);
     timelineEvidence.install();
 
     // =====================
@@ -51,10 +54,13 @@
     function createTimelineEvidence(localWindow, pageWindow) {
         const records = new Map();
         const states = new Map();
+        const listeners = new Set();
+        const changedIds = new Set();
+        let notificationTimer = null;
         const MAX_RECORDS = 6000;
         const MAX_NODES = 20000;
         const MAX_DEPTH = 30;
-        const allowedOperations = new Set(['UserTweetsAndReplies', 'UserTweets', 'UserMedia', 'TweetDetail', 'SearchTimeline', 'HomeTimeline', 'HomeLatestTimeline']);
+        const allowedOperations = new Set(['UserTweetsAndReplies', 'UserRepliesTimeline', 'UserTweets', 'UserMedia', 'TweetDetail', 'SearchTimeline', 'HomeTimeline', 'HomeLatestTimeline']);
         const parentKeys = ['in_reply_to_status_id_str', 'inReplyToStatusIdStr', 'in_reply_to_status_id', 'inReplyToStatusId'];
         const conversationKeys = ['conversation_id_str', 'conversationIdStr', 'conversation_id', 'conversationId'];
         const ignoredKeys = new Set(['entities', 'extended_entities', 'media', 'full_text', 'text', 'description', 'bio', 'note_tweet', 'card', 'core']);
@@ -82,6 +88,25 @@
             return typeof value === 'string' && /^[1-9]\d{0,24}$/.test(value) ? value : null;
         };
         const object = value => !!value && typeof value === 'object';
+
+        function notifyChanged(id) {
+            changedIds.add(id);
+            if (notificationTimer !== null || !listeners.size) return;
+            notificationTimer = localWindow.setTimeout(() => {
+                notificationTimer = null;
+                const ids = Array.from(changedIds);
+                changedIds.clear();
+                for (const listener of listeners) {
+                    try { listener(ids); } catch (_) { /* 统计回填不能影响页面响应 */ }
+                }
+            }, 0);
+        }
+
+        function subscribe(listener) {
+            if (typeof listener !== 'function') return () => {};
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+        }
 
         function classify(entity) {
             const wrappers = new Set();
@@ -182,6 +207,7 @@
         }
 
         function remember(sample, operation) {
+            const oldRecord = records.get(sample.id);
             const previous = states.get(sample.id);
             const mask = sample.conflict ? 3 : sample.reply === true ? 1 : sample.reply === false ? 2 : 0;
             const combined = previous ? previous.mask | mask : mask;
@@ -196,11 +222,16 @@
             states.delete(sample.id);
             states.set(sample.id, state);
             records.delete(sample.id);
-            records.set(sample.id, {
+            const record = {
                 id: sample.id, reply: conflict ? null : combined === 1 ? true : combined === 2 ? false : null,
                 replyTo: conflict ? null : state.replyTo, conversationId: state.conversationId,
                 source: 'network:' + operation, time: now(), conflict
-            });
+            };
+            records.set(sample.id, record);
+            if (!oldRecord || oldRecord.reply !== record.reply || oldRecord.conflict !== record.conflict
+                || oldRecord.replyTo !== record.replyTo || oldRecord.conversationId !== record.conversationId) {
+                notifyChanged(sample.id);
+            }
             while (records.size > MAX_RECORDS) {
                 const oldest = records.keys().next().value;
                 records.delete(oldest);
@@ -444,7 +475,7 @@
         }
 
         function diagnostics() { return Object.assign({}, status, { cached: records.size }); }
-        return { records, lookup, classify, capture, install, diagnostics };
+        return { records, lookup, classify, capture, install, diagnostics, subscribe };
     }
     // XGW_TIMELINE_EVIDENCE_END
     // CONFIG（全局常量）
@@ -457,7 +488,7 @@
         try { return localStorage.getItem('xpc_debug') === '1'; } catch (err) { return false; }
     })();
 
-    const VERSION = '0.3.16';
+    const VERSION = '0.3.17';
     const SCRIPT_NAME = 'X GeWu';
 
     const CONFIG = {
@@ -646,6 +677,9 @@
         // 去重（需求 14）
         seenIds: new Set(),        // 本次任务扫描过去重的 id（防重复统计）
         scanRecords: new Map(),    // ID 去重与判定分开；后补证据可更新原统计
+        postScanContext: null,     // 本批筛选条件保留至下次重置，结束后补证仍属于原扫描
+        postScanPrepared: false,   // 完成或停止后的扫描清单可供下一次清理承接
+        deleteCandidateScope: null,// 清理承接清单时，只重新找回这些 ID，不扩大候选
         scanRevision: 0,
         candidateLimitHit: false,  // 达到上限后不因撤回候选而自动补扫
         candidateIds: new Set(),   // 本次收集的候选；达到上限后不再扩充，即使有操作失败
@@ -1301,7 +1335,8 @@
             for (const key of keys) {
                 if (/^__reactProps\$/.test(key)) roots.push(ownData(node, key));
                 if (!/^__react(?:Fiber|InternalInstance)\$/.test(key)) continue;
-                for (let fiber = committedFiber(ownData(node, key)), hops = 0; fiber && hops < 12; fiber = ownData(fiber, 'return'), hops++) {
+                // 真实 X 的 tweet 可在第 13 层以上；仍在已提交分支与时间线边界内有界查找。
+                for (let fiber = committedFiber(ownData(node, key)), hops = 0; fiber && hops < 32; fiber = ownData(fiber, 'return'), hops++) {
                     if (fibers.has(fiber)) break;
                     fibers.add(fiber);
                     const host = ownData(fiber, 'stateNode');
@@ -1333,7 +1368,10 @@
                 // __reactProps 是 DOM 的当前 props；缓存 fiber 的旧 props 不能覆盖它。
                 if (usedFibers || signals.size || conflict) break;
                 usedFibers = true;
-                queue.push(...fiberRoots.filter((value) => value && typeof value === 'object')
+                // DOM 当前 props 仍优先；fallback 时先读直接 tweet，避免组件 children 消耗预算。
+                const directTweets = fiberRoots.map((value) => ownData(value, 'tweet'))
+                    .filter((value) => value && typeof value === 'object');
+                queue.push(...directTweets.concat(fiberRoots).filter((value) => value && typeof value === 'object')
                     .map((value) => ({ value, depth: 0 })));
                 if (cursor >= queue.length) break;
             }
@@ -1485,6 +1523,7 @@
                 url: 'https://x.com/' + info.username + '/status/' + info.id,
                 type: type,
                 isReply: isReply,
+                replyContext: replyContext,
                 hasQuote: hasQuote,
                 replyReason: replyConflict ? '回复证据冲突' : replyPending ? '回复关系暂未确认' : '',
                 promoted: promoted,
@@ -1550,9 +1589,8 @@
         return { ok: true };
     }
 
-    function filterResult(post) {
+    function filterResult(post, opts = activeSettings()) {
         if (post.promoted) return { ok: false, reason: '推广内容' };
-        const opts = activeSettings();
 
         // 以当前账号的 unretweet 状态作为取消转帖凭据，不依赖不存在的专用标签页。
         if (post.type === 'repost') {
@@ -1572,13 +1610,13 @@
     // SCANNER（需求十三、十四：无限滚动 + 去重；需求三十一：只扫 primaryColumn）
     // =====================
 
-    function candidateLimitReached() {
-        const limit = activeSettings().maxDelete;
+    function candidateLimitReached(opts = activeSettings()) {
+        const limit = opts.maxDelete;
         return limit > 0 && (state.candidateLimitHit || state.stats.matched >= limit);
     }
 
-    function scanVerdict(post) {
-        const verdict = filterResult(post);
+    function scanVerdict(post, opts = activeSettings()) {
+        const verdict = filterResult(post, opts);
         if (verdict.ok && state.attemptedIds.has(post.id)) {
             return { ok: false, reason: '本页面会话已提交过此帖的操作' };
         }
@@ -1597,10 +1635,90 @@
         else delete state.skipReasonCounts[reason];
     }
 
-    function recordScannedPost(post, verdict) {
+    function snapshotScannedPost(post) {
+        // 只保存重新筛选所需的原帖字段，不持有 article/React/正文对象。
+        return {
+            id: post.id, url: post.url, username: post.username, timestamp: post.timestamp,
+            type: post.type, isOwner: post.isOwner, promoted: post.promoted,
+            activeRepost: post.activeRepost, isReply: post.isReply,
+            replyContext: post.replyContext === true, hasQuote: post.hasQuote === true,
+            replyReason: post.replyReason || ''
+        };
+    }
+
+    function ensurePostScanContext() {
+        if (!state.postScanContext) {
+            state.postScanContext = {
+                user: state.currentUser, href: location.href,
+                settings: JSON.parse(JSON.stringify(activeSettings()))
+            };
+        }
+        return state.postScanContext;
+    }
+
+    function postFilterSignature(opts) {
+        return JSON.stringify(['post', 'reply', 'quote', 'repost'].map((type) => !!opts.types[type])
+            .concat([opts.dateFrom || '', opts.dateTo || '', opts.maxDelete]));
+    }
+
+    function hasPreparedPostScan(opts = activeSettings()) {
+        const context = state.postScanContext;
+        return !!(state.postScanPrepared && context && context.user && context.user === state.currentUser
+            && context.href === location.href && postFilterSignature(context.settings) === postFilterSignature(opts));
+    }
+
+    function remainingPostCandidateIds() {
+        const ids = state.deleteCandidateScope || state.candidateIds;
+        return Array.from(ids).filter((id) => state.candidateIds.has(id)
+            && !state.attemptedIds.has(id) && !state.taskTriedIds.has(id));
+    }
+
+    function updateLatePostEvidence(ids) {
+        const context = state.postScanContext;
+        if (!context || !context.user || context.user !== state.currentUser || context.href !== location.href) return;
+        const revision = state.scanRevision;
+        // 同一响应中多条补证按原扫描顺序处理，候选上限仍优先保留先扫描的帖子。
+        const knownIds = ids.filter((id) => state.scanRecords.has(id)).sort((a, b) =>
+            state.scanRecords.get(a).order - state.scanRecords.get(b).order);
+        for (const id of knownIds) {
+            // 确认后的清单只允许收缩；晚到的证据不能增加未经确认的清理目标。
+            if (state.deleteCandidateScope && !state.deleteCandidateScope.has(id)) continue;
+            const confirmedIds = ui.confirmContext && ui.confirmContext.candidateIds;
+            if (Array.isArray(confirmedIds) && !confirmedIds.includes(id)) continue;
+            const previous = state.scanRecords.get(id);
+            if (!previous || !previous.post || state.attemptedIds.has(id) || state.taskTriedIds.has(id)
+                || state.dryRunTriedIds.has(id)) continue;
+            const loaded = timelineEvidence.lookup(id);
+            if (!loaded || loaded.id !== id || (!loaded.conflict && typeof loaded.reply !== 'boolean')) continue;
+            const post = Object.assign({}, previous.post);
+            // 作者、发布时间、引用/转帖/广告标记来自原外层帖子；网络只补回复关系。
+            const conflict = loaded.conflict || (loaded.reply === false && post.replyContext);
+            post.isReply = !conflict && (loaded.reply === true || post.replyContext);
+            post.replyReason = conflict ? '回复证据冲突' : '';
+            if (post.promoted) post.type = 'unknown';
+            else if (previous.post.type === 'repost') post.type = 'repost';
+            else if (conflict) post.type = 'unknown';
+            else if (post.isReply) post.type = 'reply';
+            else if (post.hasQuote) post.type = 'quote';
+            else post.type = 'post';
+            const verdict = scanVerdict(post, context.settings);
+            if (verdict.ok && !previous.ok && candidateLimitReached(context.settings)) {
+                verdict.ok = false;
+                verdict.reason = '本次候选已达上限，未加入候选';
+            }
+            recordScannedPost(post, verdict, context.settings);
+        }
+        if (state.scanRevision !== revision) updatePanel();
+    }
+
+    function recordScannedPost(post, verdict, opts = activeSettings()) {
+        ensurePostScanContext();
         const previous = state.scanRecords.get(post.id);
         const key = scanRecordKey(post, verdict);
-        if (previous && previous.key === key) return;
+        if (previous && previous.key === key) {
+            previous.post = snapshotScannedPost(post);
+            return;
+        }
         if (previous) {
             state.byType[previous.type]--;
             if (previous.ok) {
@@ -1620,14 +1738,15 @@
             state.candidateIds.add(post.id);
             state.stats.matched++;
             state.eligibleByType[post.type] = (state.eligibleByType[post.type] || 0) + 1;
-            const limit = activeSettings().maxDelete;
+            const limit = opts.maxDelete;
             if (limit > 0 && state.stats.matched >= limit) state.candidateLimitHit = true;
         } else {
             state.stats.skipped++;
             adjustSkipReason(verdict.reason, 1);
             logDev('跳过 ' + post.id + ': ' + verdict.reason);
         }
-        state.scanRecords.set(post.id, { key, type: post.type, ok: verdict.ok, reason: verdict.reason || '' });
+        state.scanRecords.set(post.id, { key, type: post.type, ok: verdict.ok, reason: verdict.reason || '',
+            post: snapshotScannedPost(post), order: previous ? previous.order : state.scanRecords.size });
         state.scanRevision++;
         logDev('扫描 ' + post.id + ' 类型=' + post.type + ' owner=' + post.isOwner + ' "' + truncate(post.text, 40) + '"');
     }
@@ -1643,9 +1762,10 @@
 
         for (const articleEl of articles) {
             const limitWasReached = candidateLimitReached();
-            if (limitWasReached) {
+            if (state.deleteCandidateScope || limitWasReached) {
                 const main = mainStatus(articleEl);
-                if (!main || !state.candidateIds.has(main.info.id)
+                const allowed = state.deleteCandidateScope || state.candidateIds;
+                if (!main || !allowed.has(main.info.id)
                     || state.attemptedIds.has(main.info.id) || state.taskTriedIds.has(main.info.id)) continue;
             }
             const post = parseArticle(articleEl);
@@ -1714,6 +1834,15 @@
         for (const article of root.querySelectorAll(SELECTORS.article)) {
             if ((article.parentElement && article.parentElement.closest('article')) || !isVisible(article)) continue;
             const main = mainStatus(article);
+            if (state.deleteCandidateScope) {
+                if (!main || !state.deleteCandidateScope.has(main.info.id)
+                    || state.attemptedIds.has(main.info.id) || state.taskTriedIds.has(main.info.id)) continue;
+                const post = parseArticle(article);
+                if (post && scanVerdict(post).ok) return true;
+                const previous = state.scanRecords.get(main.info.id);
+                if (post && previous && previous.key !== scanRecordKey(post, scanVerdict(post))) return true;
+                continue;
+            }
             if (main && state.seenIds.has(main.info.id)) {
                 if (state.attemptedIds.has(main.info.id) || state.taskTriedIds.has(main.info.id)) continue;
                 const post = parseArticle(article);
@@ -1766,12 +1895,13 @@
 
     // Loading, scrolling and genuinely new posts are separate outcomes.
     async function scrollAndWaitForNew(waitMs) {
-        if (candidateLimitReached() || !canAct()) return { newPosts: false, advanced: false };
+        if ((candidateLimitReached() && !state.deleteCandidateScope) || !canAct()) return { newPosts: false, advanced: false };
         const target = postScrollTarget();
         const beforeY = postScrollPosition(target);
         const startedAt = Date.now();
         const limit = activeSettings().maxDelete;
-        log('正在加载更多帖子（符合条件 ' + state.stats.matched + (limit > 0 ? '/' + limit : '') + '）');
+        log(state.deleteCandidateScope ? '正在逐屏找回已扫描候选（待处理 ' + remainingPostCandidateIds().length + '）'
+            : '正在加载更多帖子（符合条件 ' + state.stats.matched + (limit > 0 ? '/' + limit : '') + '）');
         // 小步且保留重叠区域，避免跳过虚拟时间线中未扫描的帖子。
         const step = Math.max(240, Math.round((target ? target.clientHeight : window.innerHeight) * 0.65));
         if (target) {
@@ -2089,6 +2219,9 @@
         state.skipReasonCounts = {};
         state.seenIds = new Set();
         state.scanRecords = new Map();
+        state.postScanContext = null;
+        state.postScanPrepared = false;
+        state.deleteCandidateScope = null;
         state.scanRevision = 0;
         state.candidateLimitHit = false;
         state.candidateIds = new Set();
@@ -2099,6 +2232,19 @@
         state.consecutiveFailures = 0;
         state.actionBlockReason = '';
         // attemptedIds 仅保存实际提交的操作，未提交的失败允许在下次任务重试。
+    }
+
+    function resumePreparedPostDelete(candidateIds) {
+        // 保留原扫描统计和证据，仅重置这次执行的进度；实际已提交的 ID 仍不能重试。
+        state.deleteCandidateScope = candidateIds;
+        state.stats.deleted = 0;
+        state.stats.wouldDelete = 0;
+        state.stats.failed = 0;
+        state.taskTriedIds = new Set();
+        state.dryRunTriedIds = new Set();
+        state.pendingPostCount = 0;
+        state.consecutiveFailures = 0;
+        state.actionBlockReason = '';
     }
 
     async function beginTask(phase, approval) {
@@ -2124,6 +2270,10 @@
         }
         if (!following && !Object.values(opts.types).some(Boolean)) { log('请至少勾选一种清理类型', 'warn'); return; }
         if (document.hidden && !opts.allowBackground) { log('请在前台标签页启动任务', 'warn'); return; }
+        const preparedIds = phase === 'delete' && hasPreparedPostScan(opts)
+            ? new Set(approval && Array.isArray(approval.candidateIds)
+                ? approval.candidateIds.filter((id) => state.candidateIds.has(id)) : state.candidateIds)
+            : null;
         Object.freeze(opts.types);
         state.taskSettings = Object.freeze(opts);
         state.taskContext = context;
@@ -2132,6 +2282,7 @@
         state.paused = false;
         state.autoPauseReason = null;
         state.phase = phase;
+        state.deleteCandidateScope = preparedIds;
         updatePanel();
         let started = false;
         try {
@@ -2141,8 +2292,10 @@
                 log('无法开始：另一个标签页正在执行清理，或运行锁无法保存', 'error'); return;
             }
             if (state.stopRequested || !validateTaskContext()) return;
-            resetTaskStats();
+            if (preparedIds) resumePreparedPostDelete(preparedIds);
+            else resetTaskStats();
             if (following) resetFollowingTask();
+            else ensurePostScanContext();
             state.running = true;
             state.starting = false;
             started = true;
@@ -2164,6 +2317,7 @@
                 state.phase = 'idle';
                 state.taskSettings = null;
                 state.taskContext = null;
+                state.deleteCandidateScope = null;
                 updatePanel();
             }
         }
@@ -2177,11 +2331,16 @@
 
     function finishTask() {
         const phase = state.phase;
+        if (phase === 'scan' || phase === 'delete') {
+            const context = state.postScanContext;
+            state.postScanPrepared = !!(context && context.user === state.currentUser && context.href === location.href);
+        }
         state.running = false;
         state.paused = false;
         state.phase = 'idle';
         state.taskSettings = null;
         state.taskContext = null;
+        state.deleteCandidateScope = null;
         state.autoPauseReason = null;
         stopLockHeartbeat();
         releaseLock();
@@ -2198,27 +2357,59 @@
         updatePanel();
     }
 
+    async function preparePostTimelineTop(initialTarget, message) {
+        const needsScroll = postScrollPosition(initialTarget) > 2;
+        const nodesNearTopViewport = (root) => {
+            const articles = root ? Array.from(root.querySelectorAll(SELECTORS.article)) : [];
+            if (!articles.length) return true;
+            const view = initialTarget ? initialTarget.getBoundingClientRect() : null;
+            const height = initialTarget ? initialTarget.clientHeight : window.innerHeight;
+            const top = view ? view.top : 0;
+            return articles.some((article) => {
+                const rect = article.getBoundingClientRect();
+                return rect.bottom > top && rect.top < top + height * 2;
+            });
+        };
+        // 已在顶部且节点位置正常时，可扫描已加载内容；后台加载更多不能挡住首屏统计。
+        if (!needsScroll && nodesNearTopViewport(document.querySelector(SELECTORS.primaryColumn))) return true;
+        if (needsScroll) log(message);
+        const signature = () => {
+            const root = document.querySelector(SELECTORS.primaryColumn);
+            return root ? Array.from(root.querySelectorAll(SELECTORS.article))
+                .map((article) => { const main = mainStatus(article); return main ? main.info.id : ''; }).join(',') : '';
+        };
+        const previousIds = signature();
+        try {
+            if (needsScroll) {
+                if (initialTarget) initialTarget.scrollTop = 0;
+                else window.scrollTo(0, 0);
+            }
+            while (taskActive()) {
+                await pauseGate();
+                if (!taskActive()) return false;
+                if (!canAct()) continue;
+                const ready = await waitForCondition(() => {
+                    const root = document.querySelector(SELECTORS.primaryColumn);
+                    if (postScrollPosition(initialTarget) > 2 || !root || postTimelineSignals(root).loading) return false;
+                    if (signature() !== previousIds) return true;
+                    // 同一批节点可能已完整保留；确认它们已在顶部窗口附近，而非底部的旧虚拟节点。
+                    return nodesNearTopViewport(root);
+                }, CONFIG.SCROLL_WAIT_MS, '等待顶部时间线恢复', () => !canAct());
+                if (ready) return true;
+                if (taskActive() && !state.paused) autoPause('时间线顶部尚未恢复，已保留候选；页面加载完成后点击继续。');
+            }
+        } catch (err) {
+            autoPause('回到时间线顶部失败，已保留候选；请回到顶部后继续。');
+            await pauseGate();
+            return false;
+        }
+        return false;
+    }
+
     async function runScan() {
         const initialTarget = postScrollTarget();
         const startScrollY = postScrollPosition(initialTarget);
-        if (startScrollY > 2) {
-            log('从时间线顶部开始核对，结束后恢复原浏览位置');
-            try {
-                const signature = () => {
-                    const root = document.querySelector(SELECTORS.primaryColumn);
-                    return root ? Array.from(root.querySelectorAll(SELECTORS.article))
-                        .map((article) => { const main = mainStatus(article); return main ? main.info.id : ''; }).join(',') : '';
-                };
-                const previousIds = signature();
-                if (initialTarget) initialTarget.scrollTop = 0;
-                else window.scrollTo(0, 0);
-                await waitForCondition(() => {
-                    const root = document.querySelector(SELECTORS.primaryColumn);
-                    return postScrollPosition(initialTarget) <= 2 && !postTimelineSignals(root).loading
-                        && signature() !== previousIds;
-                }, CONFIG.SCROLL_WAIT_MS, '等待顶部时间线恢复', () => !canAct());
-            } catch (err) { logDev('回到时间线顶部失败，继续核对当前加载内容'); }
-        }
+        if (!(await preparePostTimelineTop(initialTarget, '从时间线顶部开始核对，结束后恢复原浏览位置'))) return;
         let progress = newPostScanProgress();
         while (taskActive()) {
             const wasPaused = state.paused;
@@ -2255,6 +2446,12 @@
         const enabled = Object.keys(opts.types).filter((type) => opts.types[type]).map((type) => TYPE_LABELS[type]);
         log('类型 [' + enabled.join('/') + '] ｜ 上限 ' + (opts.maxDelete || '无限制')
             + ' ｜ 间隔 ' + opts.intervalMinSec + '~' + opts.intervalMaxSec + ' 秒');
+        if (state.deleteCandidateScope) {
+            log('沿用已扫描候选清单：' + state.deleteCandidateScope.size + ' 条，待处理 ' + remainingPostCandidateIds().length
+                + ' 条；逐屏找回并重新复验，不增加新候选');
+            if (!remainingPostCandidateIds().length) return;
+        }
+        if (!(await preparePostTimelineTop(postScrollTarget(), '从时间线顶部开始清理，逐屏找回待处理帖子'))) return;
         let progress = newPostScanProgress();
         while (taskActive()) {
             const wasPaused = state.paused;
@@ -2266,7 +2463,8 @@
             if (opts.maxDelete > 0 && done >= opts.maxDelete) {
                 log('已达到本次清理上限（' + opts.maxDelete + '），任务结束'); break;
             }
-            if (candidateLimitReached() && state.taskTriedIds.size >= state.candidateIds.size) {
+            if (state.deleteCandidateScope ? !remainingPostCandidateIds().length
+                : candidateLimitReached() && state.taskTriedIds.size >= state.candidateIds.size) {
                 log('本次候选已全部处理（' + state.candidateIds.size + '），不再扫描新帖子'); break;
             }
             if (!canAct()) continue;
@@ -2281,12 +2479,19 @@
             recordPostScanProgress(progress);
             updatePanel();
             if (!batch.length) {
-                if (candidateLimitReached()) {
+                if (candidateLimitReached() && !state.deleteCandidateScope) {
                     log('已收集本次上限的候选，没有更多可处理候选，不再扫描新帖子'); break;
                 }
                 const result = await scrollAndWaitForNew(progress.emptyRounds > 0 ? CONFIG.SCROLL_REWAIT_MS : 0);
                 if (!taskActive() || state.paused) continue;
-                if (postScanReachedEnd(progress, result)) { log('时间线连续等待后仍无新增帖子，没有更多可处理内容'); break; }
+                // 承接清单时，重新走过已扫描的页面也是有效定位进度。
+                if (state.deleteCandidateScope && result.advanced) progress.lastProgressAt = Date.now();
+                if (postScanReachedEnd(progress, result)) {
+                    const remaining = state.deleteCandidateScope ? remainingPostCandidateIds().length : 0;
+                    log(remaining ? '已到时间线末尾；' + remaining + ' 条已扫描候选暂未在当前页面找回，可稍后重试'
+                        : '时间线连续等待后仍无新增帖子，没有更多可处理内容', remaining ? 'warn' : 'info');
+                    break;
+                }
                 continue;
             }
             progress.emptyRounds = 0;
@@ -2423,7 +2628,7 @@
             candidate: state.stats.matched,
             deleted: state.stats.deleted,
             simulated: state.stats.wouldDelete,
-            remaining: Math.max(0, state.candidateIds.size - state.taskTriedIds.size),
+            remaining: remainingPostCandidateIds().length,
             total: state.totalDeleted,
         };
     }
@@ -2780,11 +2985,11 @@
     // =====================
 
     const CSS_TEXT = [
-        '#xpc-root{position:fixed;right:8px;bottom:8px;width:330px;max-width:calc(100vw - 16px);z-index:2147483000;color:#e7e9ea;background:#15202b;border:1px solid #38444d;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.6);font:12px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;user-select:none}',
+        '#xpc-root{position:fixed;right:8px;bottom:8px;display:flex;flex-direction:column;box-sizing:border-box;width:330px;max-width:calc(100vw - 16px);height:min(680px,calc(100vh - 16px));max-height:calc(100vh - 16px);overflow:hidden;z-index:2147483000;color:#e7e9ea;background:#15202b;border:1px solid #38444d;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.6);font:12px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;user-select:none}',
         '#xpc-root *{box-sizing:border-box;margin:0;padding:0;font-family:inherit}',
-        '#xpc-root.xpc-minimized{width:auto}',
-        '#xpc-root.xpc-minimized .xpc-body{display:none}',
-        '.xpc-header{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid #38444d;cursor:move;font-weight:700;font-size:13px}',
+        '#xpc-root.xpc-minimized{width:auto;height:auto}',
+        '#xpc-root.xpc-minimized .xpc-body,#xpc-root.xpc-minimized .xpc-footer{display:none}',
+        '.xpc-header{display:flex;flex:0 0 auto;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid #38444d;cursor:move;font-weight:700;font-size:13px}',
         '.xpc-minimized .xpc-header{border-bottom:none}',
         '#xpc-root .xpc-header-copy{display:flex;align-items:baseline;flex-wrap:wrap;gap:0 4px;flex:1 1 auto;min-width:0}',
         '#xpc-root .xpc-title{color:#1d9bf0;text-decoration:none;cursor:pointer;border-radius:4px;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
@@ -2798,7 +3003,10 @@
         '.xpc-dot-pause{background:#ffd400}',
         '#xpc-root .xpc-min{margin-left:auto;flex:0 0 auto;background:transparent;border:none;color:#71767b;font-size:14px;cursor:pointer;padding:0 2px;line-height:1}',
         '#xpc-root .xpc-min:hover{color:#e7e9ea}',
-        '.xpc-body{padding:10px 12px;max-height:min(72vh,640px);overflow:auto}',
+        '#xpc-root .xpc-body{flex:1 1 auto;min-height:0;padding:10px 12px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}',
+        '#xpc-root .xpc-footer{flex:0 0 auto;padding:10px 12px;border-top:1px solid #38444d;background:#15202b}',
+        '#xpc-root .xpc-footer>.xpc-btn{display:block;width:100%}',
+        '#xpc-root .xpc-skip-reasons{max-height:96px;overflow:auto;overflow-wrap:anywhere;overscroll-behavior:contain;user-select:text}',
         '.xpc-context{font-size:11px;color:#71767b;margin-bottom:8px;word-break:break-all}',
         '#xpc-root .xpc-follow-nav{display:block;color:#1d9bf0;font-size:12px;margin:4px 0 8px}',
         '.xpc-ok{color:#00ba7c}',
@@ -2990,7 +3198,7 @@
         const quotaLine = el('div', 'xpc-quota');
         const countLine = el('div', 'xpc-count-line');
         countLine.title = '候选只计算已扫描内容，受最大删除限制；累计确认成功按账号保存，含取消转帖';
-        const skipLine = el('div', 'xpc-hint');
+        const skipLine = el('div', 'xpc-hint xpc-skip-reasons');
         skipLine.setAttribute('aria-live', 'polite');
         const banner = el('div', 'xpc-banner');
 
@@ -3014,12 +3222,16 @@
         const btnExport = el('button', 'xpc-btn', '导出诊断日志');
         btnExport.type = 'button';
 
-        body.append(ctx, secType, secOpt, secDates, secParam, stats, countLine, skipLine, quotaLine, banner, btnRow1, btnRow2, btnExport, logBox);
-        root.append(header, body);
+        const footer = el('div', 'xpc-footer');
+        footer.setAttribute('role', 'group');
+        footer.setAttribute('aria-label', '扫描和清理操作');
+        footer.append(btnRow1, btnRow2, btnExport);
+        body.append(ctx, secType, secOpt, secDates, secParam, stats, countLine, skipLine, quotaLine, banner, logBox);
+        root.append(header, body, footer);
         document.body.appendChild(root);
 
         Object.assign(ui, {
-            root, dot, minBtn, ctx, dryInput, logInput, bgInput,
+            root, body, footer, dot, minBtn, ctx, dryInput, logInput, bgInput,
             inpMax, inpIntervalMin, inpIntervalMax, inpHourly, inpDaily,
             inpDateFrom, inpDateTo, btnClearDates, dateHint, countLine, skipLine,
             btnScan, btnDelete, btnPause, btnStop,
@@ -3039,6 +3251,7 @@
         ui.minBtn.addEventListener('click', () => {
             const minimized = ui.root.classList.toggle('xpc-minimized');
             ui.minBtn.textContent = minimized ? '+' : '—';
+            restorePanelPosition();
         });
 
         ui.root.querySelector('.xpc-header').addEventListener('pointerdown', onDragStart);
@@ -3062,6 +3275,7 @@
             } else {
                 log('Dry Run 已关闭：点击「开始删除」将真实删除内容！', 'warn');
             }
+            updateButtons();
         });
 
         ui.logInput.addEventListener('change', () => {
@@ -3147,6 +3361,9 @@
             following: getFollowingDiagnostics(),
             skipReasons: state.skipReasonCounts, autoPauseReason: state.autoPauseReason,
             timelineEvidence: timelineEvidence.diagnostics(), pendingPostCount: state.pendingPostCount,
+            scannedPosts: Array.from(state.scanRecords, ([id, record]) => ({
+                id, type: record.type, matched: record.ok, reason: record.reason
+            })),
             actionBlockReason: state.actionBlockReason,
             attemptedIds: Array.from(state.attemptedIds), logs: state.logs,
         };
@@ -3175,7 +3392,7 @@
 
         const onMove = (e) => {
             root.style.left = clamp(e.clientX - shiftX, 0, Math.max(0, window.innerWidth - rect.width)) + 'px';
-            root.style.top = clamp(e.clientY - shiftY, 0, Math.max(0, window.innerHeight - 40)) + 'px';
+            root.style.top = clamp(e.clientY - shiftY, 0, Math.max(0, window.innerHeight - rect.height)) + 'px';
         };
         const onUp = () => {
             window.removeEventListener('pointermove', onMove);
@@ -3200,7 +3417,7 @@
         root.style.right = 'auto';
         root.style.bottom = 'auto';
         root.style.left = clamp(pos.x, 0, Math.max(0, window.innerWidth - rect.width)) + 'px';
-        root.style.top = clamp(pos.y, 0, Math.max(0, window.innerHeight - 40)) + 'px';
+        root.style.top = clamp(pos.y, 0, Math.max(0, window.innerHeight - rect.height)) + 'px';
     }
 
     function applySettingsToInputs() {
@@ -3297,6 +3514,10 @@
         const locked = busy || !!ui.confirmMask;
         ui.btnScan.disabled = locked || !state.pageTaskReady || ['following', 'followers'].includes(state.pageTab);
         ui.btnDelete.disabled = locked || !state.pageTaskReady || ['following', 'followers'].includes(state.pageTab);
+        const dryRun = activeSettings().dryRun;
+        ui.btnDelete.textContent = dryRun ? '开始模拟' : '开始删除';
+        ui.btnDelete.title = dryRun ? '当前为模拟模式，只演练不删除；真实删除请先关闭 Dry Run 模拟模式'
+            : '当前为真实删除模式；确认后按所选类型、日期和数量上限执行';
         ui.btnPause.disabled = !state.running || state.stopRequested;
         ui.btnStop.disabled = !busy || state.stopRequested;
         const controls = Object.values(ui.typeChecks).concat([
@@ -3345,11 +3566,15 @@
     function showDeleteConfirmModal() {
         const error = dateRangeError(settings);
         if (error) { log('无法开始：' + error, 'error'); updatePanel(); return; }
-        // 用当前可见范围做一次快照统计，让确认框里的数字是真实的
-        resetTaskStats();
-        scanVisible();
+        // 已扫描清单（包括零候选）保留至确认；没有清单时才统计当前可见范围。
+        const prepared = hasPreparedPostScan(settings);
+        if (!prepared) {
+            resetTaskStats();
+            scanVisible();
+        }
         updatePanel();
         const approval = { user: state.currentUser, href: location.href, settings: JSON.parse(JSON.stringify(settings)) };
+        if (prepared) approval.candidateIds = Array.from(state.candidateIds);
 
         const mask = el('div', 'xpc-modal-mask');
         const modal = el('div', 'xpc-modal');
@@ -3361,12 +3586,13 @@
         const ebt = state.eligibleByType;
         const lines = [
             '帖子日期（本地）：' + dateRangeLabel(settings),
-            '本次候选（当前已加载内容）：' + state.stats.matched + ' 条',
+            '本次候选（' + (prepared ? '沿用已扫描清单' : '当前已加载内容') + '）：' + state.stats.matched + ' 条',
             '普通帖子 ' + (ebt.post || 0) + ' ｜ 回复 ' + (ebt.reply || 0)
             + ' ｜ Quote ' + (ebt.quote || 0) + ' ｜ Repost ' + (ebt.repost || 0),
             '删除上限：' + (settings.maxDelete > 0 ? settings.maxDelete : '无限制')
             + ' ｜ 间隔：' + settings.intervalMinSec + '~' + settings.intervalMaxSec + ' 秒（随机）',
-            '扫描到上限数量的候选即停止加载，处理完这些候选后结束；失败不会补扫新帖子。',
+            prepared ? '从顶部逐屏找回这份清单，重新复验后处理；不会增加新候选。'
+                : '从顶部扫描到上限数量的候选即停止加载，处理完这些候选后结束；失败不会补扫新帖子。',
         ];
         for (const line of lines) modal.appendChild(el('div', 'xpc-modal-line', line));
         modal.appendChild(el('div', 'xpc-modal-warn',
@@ -4201,6 +4427,7 @@
                 settings: () => settings,
                 CONFIG: CONFIG,
                 SELECTORS: SELECTORS,
+                timelineDiagnostics: () => timelineEvidence.diagnostics(),
             });
         } catch (err) { /* noop */ }
 

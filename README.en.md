@@ -6,7 +6,7 @@
 
 X GeWu is a Tampermonkey userscript for X / Twitter. Clean up posts by date and quantity, see follow relationships in three colors, and organize your account with less effort.
 
-**v0.3.16 · Tampermonkey · MIT**
+**v0.3.17 · Tampermonkey · MIT**
 
 [Install the script](https://raw.githubusercontent.com/gegewu26-source/X-GeWu/main/X-GeWu.user.js) · [Download the latest release](https://github.com/gegewu26-source/X-GeWu/releases/latest) · [Follow GeWu for updates](https://x.com/gegewu203)
 
@@ -14,8 +14,10 @@ X GeWu is a Tampermonkey userscript for X / Twitter. Clean up posts by date and 
 
 - **Date-based cleanup**: Select a date range to delete your posts, replies and quotes, or undo your reposts.
 - **You control the quantity**: Scanning stops as soon as the candidate limit is reached. Track candidates, pending items, session successes and cumulative successes.
-- **More accurate reply detection**: Reads existing timeline responses from page startup and matches reply relationships to the outer post ID, fixing many unknown replies in v0.3.15. Waits for virtual rendering and slow loading; placeholders do not inflate counts. Refresh X after saving the update.
+- **More accurate reply detection**: Supports the new X Replies timeline and checks deeper tweet data on the actual Replies page and prioritizes the outer post ID. Late evidence can update scanned posts after they leave the visible list without double counting. Unconfirmed or conflicting relationships are skipped. Refresh X after saving an update.
 - **Resilient scanning**: Distinguishes new posts from scrolling and handles virtual lists. Long loading stalls pause with results preserved, so scanning can resume after the page recovers.
+- **Keep your scanned candidates**: After a scan finishes or is stopped manually, continue with simulation or deletion while the account, page, post types, dates and quantity stay unchanged. The script returns to the top to find and verify the original candidates.
+- **Controls stay visible**: The panel scrolls internally while pause, stop and export controls stay fixed at the bottom. The action button reads “开始模拟” with simulation enabled and “开始删除” when it is disabled.
 - **Three-color follow relationships**: Blue for mutual follows, green for accounts that only follow you, and red for accounts you follow without a visible follow-back. Colors appear directly on account cards.
 - **Convenient follow management**: Scan non-follow-back candidates, open usernames in new tabs to review their profiles, then unfollow from the approved list.
 - **Protect important accounts**: Keep the usernames you choose out of the automatic unfollow list.
@@ -30,11 +32,11 @@ Colors reflect relationships identifiable on the current page. Mutual-follow his
 2. Click “Install the script” above and confirm installation.
 3. Open or refresh X to see the **X GeWu** panel.
 
-When updating, replace the existing script instead of enabling multiple copies.
+When updating, replace the existing script instead of enabling multiple copies. From v0.3.17, explicit GitHub update-check and download URLs are included. Older copies installed by pasting code need one manual update first; Tampermonkey then checks for newer versions according to its update settings. Save the update, refresh X and confirm the panel version.
 
 ## Usage
 
-**Clean up posts**: Open your own profile, choose post types, dates and a quantity, then select “计算删除数” to count candidates. Keep Dry Run enabled for a rehearsal, check the scope, then disable simulation and start deletion.
+**Clean up posts**: Open your own profile, choose post types, dates and a quantity, then select “计算删除数” to count candidates. After the scan finishes or is stopped manually, keep the account, page, post types, dates and quantity unchanged and select “开始模拟” to rehearse the scanned candidates. Check the scope, disable Dry Run, then select “开始删除” and confirm. The script returns to the top to locate and verify each candidate. Scroll inside the panel; pause, stop and export controls remain visible at the bottom.
 
 **Manage follows**: Open your own Following list, set protected accounts and a limit, then select “扫描关注”. Review candidate profiles, run a simulation, and confirm the unfollow list. Relationship colors also work on your Followers list.
 
