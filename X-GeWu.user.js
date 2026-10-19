@@ -2,7 +2,7 @@
 // @name         X GeWu
 // @name:zh-CN   X GeWu
 // @namespace    https://x.com/gegewu203
-// @version      0.3.17
+// @version      0.3.18
 // @description  Clean your own X posts by date, highlight following relationships and unfollow accounts without a visible follow-back indicator. Dry Run, verified actions and quotas. Visits @gegewu203 on first use, then at most once every 15 days.
 // @description:zh-CN  按日期清理本人的 X 帖子；关注列表标注回关关系、记录观察到的互关历史并批量取关未显示回关的账号。默认模拟、保留名单与操作上限；首次使用跳转至 @gegewu203 主页，之后每 15 天最多一次。
 // @author       GeWu (@gegewu203)
@@ -46,7 +46,7 @@
     const timelineEvidence = createTimelineEvidence(window,
         typeof unsafeWindow === 'undefined' ? window : unsafeWindow);
     timelineEvidence.subscribe(updateLatePostEvidence);
-    timelineEvidence.install();
+    // 页面启动期间保持原生网络方法；用户开始帖子任务后才启用只读识别。
 
     // =====================
     // XGW_TIMELINE_EVIDENCE_BEGIN
@@ -379,27 +379,38 @@
                 const originalFetch = target.fetch;
                 if (typeof originalFetch === 'function') {
                     const wrappedFetch = function (...args) {
+                        // 原生请求的返回值和异常必须原样交给 X；附加识别不得改变它们。
                         const result = Reflect.apply(originalFetch, this, args);
-                        let info = requestInfo(args[0]);
-                        // 只观察 GET/POST；不读取请求头或请求体。
-                        const methodOption = optionMethod(args[1]);
-                        const method = methodOption.present ? methodOption.method : requestMethod(args[0]);
-                        if (typeof method !== 'string' || !/^(?:GET|POST)$/i.test(method)) info = null;
-                        if (info) {
-                            begin();
-                            const attached = observePromise(result, response => {
-                                responseArrived();
-                                try {
-                                    if (response.url && !requestInfo(response.url)) { finish(); return; }
-                                    const clone = Reflect.apply(response.clone, response, []);
-                                    const parsing = Reflect.apply(clone.json, clone, []);
-                                    if (!observePromise(parsing, json => {
-                                        try { capture(json, info.operation); } finally { finish(); }
-                                    }, () => { status.parseFailures++; finish(); })) finish();
-                                } catch (_) { status.parseFailures++; finish(); }
-                            }, () => { finish(); });
-                            if (!attached) finish();
-                        }
+                        try {
+                            let info = requestInfo(args[0]);
+                            // 只观察 GET/POST；不读取请求头或请求体。
+                            const methodOption = optionMethod(args[1]);
+                            const method = methodOption.present ? methodOption.method : requestMethod(args[0]);
+                            if (typeof method !== 'string' || !/^(?:GET|POST)$/i.test(method)) info = null;
+                            if (info) {
+                                let completed = false;
+                                const complete = () => {
+                                    if (completed) return;
+                                    completed = true;
+                                    try { finish(); } catch (_) { status.hookFailures++; }
+                                };
+                                begin();
+                                const attached = observePromise(result, response => {
+                                    try {
+                                        responseArrived();
+                                        if (response.url && !requestInfo(response.url)) { complete(); return; }
+                                        const clone = Reflect.apply(response.clone, response, []);
+                                        const parsing = Reflect.apply(clone.json, clone, []);
+                                        if (!observePromise(parsing, json => {
+                                            try { capture(json, info.operation); }
+                                            catch (_) { status.parseFailures++; }
+                                            finally { complete(); }
+                                        }, () => { status.parseFailures++; complete(); })) complete();
+                                    } catch (_) { status.parseFailures++; complete(); }
+                                }, complete);
+                                if (!attached) complete();
+                            }
+                        } catch (_) { status.hookFailures++; }
                         return result;
                     };
                     status.fetchInstalled = replace(target, 'fetch', wrappedFetch);
@@ -423,10 +434,10 @@
                         if (!flags) { flags = { load: false, end: false }; listeners.set(xhr, flags); }
                         if (!flags.load) {
                             Reflect.apply(addListener, xhr, ['load', function () {
-                                const meta = metadata.get(this);
-                                if (!meta || !meta.info) return;
-                                responseArrived();
                                 try {
+                                    const meta = metadata.get(this);
+                                    if (!meta || !meta.info) return;
+                                    responseArrived();
                                     if (this.responseURL && !requestInfo(this.responseURL)) return;
                                     const type = this.responseType;
                                     const json = type === 'json' ? this.response : type === '' || type === 'text' ? JSON.parse(this.responseText) : null;
@@ -436,31 +447,39 @@
                             flags.load = true;
                         }
                         if (!flags.end) {
-                            Reflect.apply(addListener, xhr, ['loadend', function () { stop(this); }]);
-                            Reflect.apply(addListener, xhr, ['abort', function () { stop(this); }]);
+                            Reflect.apply(addListener, xhr, ['loadend', function () { try { stop(this); } catch (_) { status.hookFailures++; } }]);
+                            Reflect.apply(addListener, xhr, ['abort', function () { try { stop(this); } catch (_) { status.hookFailures++; } }]);
                             flags.end = true;
                         }
                         return flags.end;
                     };
                     const wrappedOpen = function (...args) {
                         const result = Reflect.apply(originalOpen, this, args);
-                        // open 复用对象时，之前请求通常已同步收到 abort/loadend。
-                        stop(this);
-                        let info = requestInfo(args[1]);
-                        if (typeof args[0] !== 'string' || !/^(?:GET|POST)$/i.test(args[0])) info = null;
-                        const meta = { info, active: false, canTrack: false };
-                        metadata.set(this, meta);
-                        if (info) {
-                            try { meta.canTrack = attach(this); } catch (_) { status.hookFailures++; }
-                        }
+                        try {
+                            // open 复用对象时，之前请求通常已同步收到 abort/loadend。
+                            stop(this);
+                            let info = requestInfo(args[1]);
+                            if (typeof args[0] !== 'string' || !/^(?:GET|POST)$/i.test(args[0])) info = null;
+                            const meta = { info, active: false, canTrack: false };
+                            metadata.set(this, meta);
+                            if (info) meta.canTrack = attach(this);
+                        } catch (_) { status.hookFailures++; }
                         return result;
                     };
                     const wrappedSend = function (...args) {
-                        const meta = metadata.get(this);
-                        const started = !!(meta && meta.info && meta.canTrack && !meta.active);
-                        if (started) { meta.active = true; begin(); }
+                        let started = false;
+                        try {
+                            const meta = metadata.get(this);
+                            started = !!(meta && meta.info && meta.canTrack && !meta.active);
+                            if (started) { meta.active = true; begin(); }
+                        } catch (_) { status.hookFailures++; }
                         try { return Reflect.apply(originalSend, this, args); }
-                        catch (error) { if (started) stop(this); throw error; }
+                        catch (error) {
+                            if (started) {
+                                try { stop(this); } catch (_) { status.hookFailures++; }
+                            }
+                            throw error;
+                        }
                     };
                     if (typeof addListener === 'function' && canWrite(prototype, 'open') && canWrite(prototype, 'send')) {
                         const openPatched = replace(prototype, 'open', wrappedOpen);
@@ -488,7 +507,7 @@
         try { return localStorage.getItem('xpc_debug') === '1'; } catch (err) { return false; }
     })();
 
-    const VERSION = '0.3.17';
+    const VERSION = '0.3.18';
     const SCRIPT_NAME = 'X GeWu';
 
     const CONFIG = {
@@ -2295,7 +2314,11 @@
             if (preparedIds) resumePreparedPostDelete(preparedIds);
             else resetTaskStats();
             if (following) resetFollowingTask();
-            else ensurePostScanContext();
+            else {
+                // 启动任务前已完成页面与账号校验，之后只读捕获本次加载的帖子关系。
+                timelineEvidence.install();
+                ensurePostScanContext();
+            }
             state.running = true;
             state.starting = false;
             started = true;
@@ -2811,6 +2834,17 @@
         return false;
     }
 
+    function xApplicationReadyForProfileVisit() {
+        try {
+            if (document.readyState === 'loading' || !document.body) return false;
+            // DOMContentLoaded 不表示 X 已完成启动；启动占位仍可见时不得打断导航。
+            const splash = document.querySelectorAll('#placeholder, [data-testid="SplashScreen"], [data-testid="splash-screen"]');
+            if (Array.from(splash).some(isVisible)) return false;
+            if (!detectCurrentUser()) return false;
+            return visibleElements(SELECTORS.profileNav + ', ' + SELECTORS.accountSwitcher).length > 0;
+        } catch (_) { return false; }
+    }
+
     function profileVisitBlockedReason() {
         if (document.hidden) return '窗口在后台，回到前台后自动重试';
         if (state.running || state.starting) return '任务正在执行，结束后自动重试';
@@ -2820,6 +2854,7 @@
         if (/^(?:\/i\/(?:flow|oauth2?|login|signup)|\/(?:login|logout|signup|oauth2?|account\/access))(?:\/|$)/i.test(location.pathname)) {
             return '正在登录或验证，完成后自动重试';
         }
+        if (!xApplicationReadyForProfileVisit()) return 'X 页面尚未完成启动，加载完成后自动重试';
         return '';
     }
 

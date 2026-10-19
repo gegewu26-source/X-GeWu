@@ -6,12 +6,13 @@
 
 X GeWu is a Tampermonkey userscript for X / Twitter. Clean up posts by date and quantity, see follow relationships in three colors, and organize your account with less effort.
 
-**v0.3.17 · Tampermonkey · MIT**
+**v0.3.18 · Tampermonkey · MIT**
 
 [Install the script](https://raw.githubusercontent.com/gegewu26-source/X-GeWu/main/X-GeWu.user.js) · [Download the latest release](https://github.com/gegewu26-source/X-GeWu/releases/latest) · [Follow GeWu for updates](https://x.com/gegewu203)
 
 ## Highlights
 
+- **Less interference during startup**: Keeps native networking methods while X starts. Read-only relationship capture begins when you start a post scan or cleanup; capture errors preserve the page request’s original return value or error.
 - **Date-based cleanup**: Select a date range to delete your posts, replies and quotes, or undo your reposts.
 - **You control the quantity**: Scanning stops as soon as the candidate limit is reached. Track candidates, pending items, session successes and cumulative successes.
 - **More accurate reply detection**: Supports the new X Replies timeline and checks deeper tweet data on the actual Replies page and prioritizes the outer post ID. Late evidence can update scanned posts after they leave the visible list without double counting. Unconfirmed or conflicting relationships are skipped. Refresh X after saving an update.
@@ -46,7 +47,7 @@ Actual post deletion cannot be undone. Keep anything you need before proceeding.
 
 Author: [GeWu · @gegewu203](https://x.com/gegewu203)
 
-The script opens the author’s profile on first use, then at most once every 15 days. Active tasks, login verification and background tabs defer the visit. Click the panel title to check for updates anytime.
+On first use, the script waits for X to finish starting and show the signed-in account and navigation before opening the author’s profile. It then visits at most once every 15 days. A visible startup screen, active tasks, login verification and background tabs defer the visit; only arriving at the author’s profile starts the interval. Click the panel title to check for updates anytime.
 
 ## License
 
